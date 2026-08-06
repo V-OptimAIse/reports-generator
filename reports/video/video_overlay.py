@@ -113,6 +113,7 @@ class ShiftVideoOverlayGenerator:
         self.text_root = self.image_root
         self.res_cfg = self.video_cfg.get("resolution", {})
         self.roi_source_size = self._configured_roi_source_size(cfg)
+        self.roi_coordinate_offset = self._configured_roi_coordinate_offset(cfg)
         self.input_images_have_overlay = self._input_images_have_overlay(cfg)
         self.rois = [] if self.input_images_have_overlay else self._load_rois_once(self._resolve_roi_path(cfg))
 
@@ -446,6 +447,20 @@ class ShiftVideoOverlayGenerator:
 
         return width, height
 
+    @staticmethod
+    def _configured_roi_coordinate_offset(cfg):
+        rois_cfg = cfg.get('rois') or {}
+        offset_cfg = rois_cfg.get('coordinate_offset') if isinstance(rois_cfg, dict) else None
+        if offset_cfg is None:
+            return 0.0, 0.0
+        if not isinstance(offset_cfg, dict):
+            raise ValueError('rois.coordinate_offset must contain x and y values')
+
+        try:
+            return float(offset_cfg.get('x', 0.0)), float(offset_cfg.get('y', 0.0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError('rois.coordinate_offset.x and y must be numbers') from exc
+
     def _input_images_have_overlay(self, cfg):
         configured = self.video_cfg.get("input_images_have_overlay", "auto")
         if str(configured).strip().lower() != "auto":
@@ -544,6 +559,17 @@ class ShiftVideoOverlayGenerator:
             return []
 
         roi_source_w, roi_source_h = self._resolve_roi_source_size(source_w, source_h)
+        offset_x, offset_y = getattr(self, 'roi_coordinate_offset', (0.0, 0.0))
+        scaled_offset_x = offset_x * output_w / float(roi_source_w)
+        scaled_offset_y = offset_y * output_h / float(roi_source_h)
+        if scaled_offset_x or scaled_offset_y:
+            logger.info(
+                'Applying ROI coordinate offset | source_offset=(%.2f, %.2f) | video_offset=(%.2f, %.2f)',
+                offset_x,
+                offset_y,
+                scaled_offset_x,
+                scaled_offset_y,
+            )
         if (roi_source_w, roi_source_h) != (source_w, source_h):
             scale_x = output_w / float(roi_source_w)
             scale_y = output_h / float(roi_source_h)
@@ -571,6 +597,15 @@ class ShiftVideoOverlayGenerator:
                 roi_source_w,
                 roi_source_h,
             )
+            if scaled_offset_x or scaled_offset_y:
+                points = [
+                    (
+                        min(max(int(round(x + scaled_offset_x)), 0), max(output_w - 1, 0)),
+                        min(max(int(round(y + scaled_offset_y)), 0), max(output_h - 1, 0)),
+                    )
+                    for x, y in points
+                ]
+
             scaled_rois.append({
                 "name": roi["name"],
                 "points": points,

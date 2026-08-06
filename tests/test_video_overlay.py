@@ -190,6 +190,24 @@ class ShiftVideoOverlayGeneratorTest(unittest.TestCase):
 
         self.assertEqual(rois[0]["points"], [(0, 0), (1309, 607)])
 
+    def test_scale_rois_applies_source_coordinate_offset(self):
+        generator = object.__new__(ShiftVideoOverlayGenerator)
+        generator.roi_source_size = (2620, 1216)
+        generator.roi_coordinate_offset = (-60.0, 0.0)
+        generator.rois = [{
+            'name': 'roi_gate2_closed',
+            'points': [(200.0, 200.0), (600.0, 400.0)],
+        }]
+
+        rois = generator._scale_rois(
+            output_w=1310,
+            output_h=608,
+            source_w=1310,
+            source_h=608,
+        )
+
+        self.assertEqual(rois[0]['points'], [(70, 100), (270, 200)])
+
     def test_scale_rois_uses_test_py_reference_size_for_saved_history_frame(self):
         generator = object.__new__(ShiftVideoOverlayGenerator)
         generator.roi_source_size = (1440, 1080)
@@ -283,6 +301,18 @@ class ShiftVideoOverlayGeneratorTest(unittest.TestCase):
         })
 
         self.assertEqual(size, (2620, 1216))
+
+    def test_configured_roi_coordinate_offset_defaults_to_zero_and_parses_values(self):
+        self.assertEqual(
+            ShiftVideoOverlayGenerator._configured_roi_coordinate_offset({}),
+            (0.0, 0.0),
+        )
+        self.assertEqual(
+            ShiftVideoOverlayGenerator._configured_roi_coordinate_offset({
+                'rois': {'coordinate_offset': {'x': -60, 'y': 10}},
+            }),
+            (-60.0, 10.0),
+        )
 
     def test_input_images_have_overlay_infers_producer_publish_overlay(self):
         with TemporaryDirectory() as tmp:
