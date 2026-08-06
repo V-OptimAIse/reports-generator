@@ -128,14 +128,14 @@ class MultiCasterConfigTest(TestCase):
         cfg = _base_cfg()
         cfg['casters']['items'][2]['enabled'] = True
         cfg['casters']['items'][2]['rois']['source_resolution'] = {
-            'width': 1310,
-            'height': 608,
+            'width': 2620,
+            'height': 1216,
         }
 
         caster2, caster3 = resolve_enabled_casters(cfg, ['caster2', 'caster3'])
 
         self.assertEqual(caster2.cfg['rois']['source_resolution'], {'width': 1440, 'height': 1080})
-        self.assertEqual(caster3.cfg['rois']['source_resolution'], {'width': 1310, 'height': 608})
+        self.assertEqual(caster3.cfg['rois']['source_resolution'], {'width': 2620, 'height': 1216})
 
     def test_legacy_single_caster_runtime_still_resolves(self):
         cfg = _base_cfg()

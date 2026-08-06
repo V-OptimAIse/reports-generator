@@ -190,12 +190,12 @@ class ShiftVideoOverlayGeneratorTest(unittest.TestCase):
 
         self.assertEqual(rois[0]["points"], [(0, 0), (1309, 607)])
 
-    def test_scale_rois_preserves_caster3_published_frame_coordinates(self):
+    def test_scale_rois_halves_caster3_original_camera_coordinates(self):
         generator = object.__new__(ShiftVideoOverlayGenerator)
-        generator.roi_source_size = (1310, 608)
+        generator.roi_source_size = (2620, 1216)
         generator.rois = [{
             'name': 'roi_gate2_open',
-            'points': [(23.0, 254.0), (2.0, 444.0), (35.0, 518.0), (129.0, 250.0)],
+            'points': [(46.0, 508.0), (4.0, 888.0), (70.0, 1036.0), (258.0, 500.0)],
         }]
 
         rois = generator._scale_rois(

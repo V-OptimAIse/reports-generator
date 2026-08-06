@@ -183,20 +183,20 @@ class Gate2ClosedPositionReportTest(unittest.TestCase):
 
         self.assertEqual(report._configured_roi_source_size(), (1440, 1080))
 
-    def test_caster3_roi_coordinates_are_already_in_saved_frame_space(self):
+    def test_caster3_original_roi_coordinates_are_halved_for_saved_frame(self):
         report = object.__new__(Gate2ClosedPositionReport)
         report.report_cfg = {}
         report.cfg = {
             'rois': {
-                'source_resolution': {'width': 1310, 'height': 608},
+                'source_resolution': {'width': 2620, 'height': 1216},
             },
         }
         report.raw_rois = {
             'roi_gate2_closed': [
-                (21.0, 251.0),
-                (592.0, 255.0),
-                (602.0, 348.0),
-                (8.0, 367.0),
+                (42.0, 502.0),
+                (1184.0, 510.0),
+                (1204.0, 696.0),
+                (16.0, 734.0),
             ],
         }
         report.roi_name = 'roi_gate2_closed'
@@ -204,7 +204,10 @@ class Gate2ClosedPositionReportTest(unittest.TestCase):
 
         report._prepare_rois_for_source_size(frame_width=1310, frame_height=608)
 
-        self.assertEqual(report.roi_points, report.raw_rois['roi_gate2_closed'])
+        self.assertEqual(
+            report.roi_points,
+            [(21.0, 251.0), (592.0, 255.0), (602.0, 348.0), (8.0, 367.0)],
+        )
 
     def test_interval_average_marks_below_threshold_as_alert(self):
         report = self._report()

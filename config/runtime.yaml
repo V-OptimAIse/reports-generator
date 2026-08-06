@@ -152,11 +152,11 @@ casters:
       var_dir: ../electrosteel_pipe_detection_prod/var/caster_3
       rois:
         path: ../electrosteel_pipe_detection_prod/config/casters/caster_3/rois.yaml
-        # Caster 3 ROI points were saved directly in the 1310x608 published-frame
-        # coordinate space. Caster 2 continues using the global 1440x1080 space.
+        # Caster 3 ROI points use the original 2620x1216 camera coordinate space.
+        # Published/history frames are exactly half-size at 1310x608.
         source_resolution:
-          width: 1310
-          height: 608
+          width: 2620
+          height: 1216
 
     - id: caster4
       number: 4
