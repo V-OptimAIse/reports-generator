@@ -155,8 +155,8 @@ casters:
         # Caster 3 ROI points use the original 2620x1216 camera coordinate space.
         # Published/history frames are exactly half-size at 1310x608.
         source_resolution:
-          width: 2620
-          height: 1216
+          width: 3100
+          height: 2000
 
     - id: caster4
       number: 4
