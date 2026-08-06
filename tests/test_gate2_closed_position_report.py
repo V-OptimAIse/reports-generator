@@ -183,33 +183,28 @@ class Gate2ClosedPositionReportTest(unittest.TestCase):
 
         self.assertEqual(report._configured_roi_source_size(), (1440, 1080))
 
-    def test_roi_coordinate_offset_matches_overlay_translation(self):
+    def test_caster3_roi_coordinates_are_already_in_saved_frame_space(self):
         report = object.__new__(Gate2ClosedPositionReport)
         report.report_cfg = {}
         report.cfg = {
             'rois': {
-                'source_resolution': {'width': 2620, 'height': 1216},
-                'coordinate_offset': {'x': -60, 'y': 0},
+                'source_resolution': {'width': 1310, 'height': 608},
             },
         }
         report.raw_rois = {
             'roi_gate2_closed': [
-                (200.0, 200.0),
-                (600.0, 200.0),
-                (600.0, 400.0),
-                (200.0, 400.0),
+                (21.0, 251.0),
+                (592.0, 255.0),
+                (602.0, 348.0),
+                (8.0, 367.0),
             ],
         }
         report.roi_name = 'roi_gate2_closed'
         report.roi_source_size = report._configured_roi_source_size()
-        report.roi_coordinate_offset = report._configured_roi_coordinate_offset()
 
         report._prepare_rois_for_source_size(frame_width=1310, frame_height=608)
 
-        self.assertEqual(
-            report.roi_points,
-            [(70.0, 100.0), (270.0, 100.0), (270.0, 200.0), (70.0, 200.0)],
-        )
+        self.assertEqual(report.roi_points, report.raw_rois['roi_gate2_closed'])
 
     def test_interval_average_marks_below_threshold_as_alert(self):
         report = self._report()

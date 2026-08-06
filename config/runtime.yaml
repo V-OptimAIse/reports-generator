@@ -152,16 +152,11 @@ casters:
       var_dir: ../electrosteel_pipe_detection_prod/var/caster_3
       rois:
         path: ../electrosteel_pipe_detection_prod/config/casters/caster_3/rois.yaml
-        # Caster 3 ROIs were captured on the full producer canvas; saved history
-        # frames are half-size. Keep Caster 2 on the global 1440x1080 ROI space.
+        # Caster 3 ROI points were saved directly in the 1310x608 published-frame
+        # coordinate space. Caster 2 continues using the global 1440x1080 space.
         source_resolution:
-          width: 2620
-          height: 1216
-        # Offset is in the ROI source coordinate space. -60 becomes -30 pixels
-        # on Caster 3's 1310x608 saved frames.
-        coordinate_offset:
-          x: -60
-          y: 0
+          width: 1310
+          height: 608
 
     - id: caster4
       number: 4

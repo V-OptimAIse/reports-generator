@@ -118,7 +118,6 @@ class Gate2ClosedPositionReport:
         self.alert_on_no_samples = self._configured_alert_on_no_samples()
         self.roi_name = str(self.report_cfg.get("roi_name") or self.DEFAULT_ROI_NAME)
         self.roi_source_size = self._configured_roi_source_size()
-        self.roi_coordinate_offset = self._configured_roi_coordinate_offset()
         self.gate2_class_id = int(self.report_cfg.get("gate2_class_id", self.DEFAULT_GATE2_CLASS_ID))
 
         history_cfg = _as_dict(self.cfg.get("history"))
@@ -491,19 +490,6 @@ class Gate2ClosedPositionReport:
             require_both=True,
         )
 
-    def _configured_roi_coordinate_offset(self) -> tuple[float, float]:
-        rois_cfg = _as_dict(getattr(self, 'cfg', {}).get('rois'))
-        offset_cfg = rois_cfg.get('coordinate_offset')
-        if offset_cfg is None:
-            return 0.0, 0.0
-        if not isinstance(offset_cfg, dict):
-            raise ValueError('rois.coordinate_offset must contain x and y values')
-
-        try:
-            return float(offset_cfg.get('x', 0.0)), float(offset_cfg.get('y', 0.0))
-        except (TypeError, ValueError) as exc:
-            raise ValueError('rois.coordinate_offset.x and y must be numbers') from exc
-
     @staticmethod
     def _find_roi_source_size_cfg(section):
         if not isinstance(section, dict):
@@ -529,28 +515,6 @@ class Gate2ClosedPositionReport:
             name: self._scale_roi_points(points, frame_width, frame_height, roi_source_width, roi_source_height)
             for name, points in self.raw_rois.items()
         }
-        offset_x, offset_y = getattr(self, 'roi_coordinate_offset', (0.0, 0.0))
-        scaled_offset_x = offset_x * frame_width / float(roi_source_width)
-        scaled_offset_y = offset_y * frame_height / float(roi_source_height)
-        if scaled_offset_x or scaled_offset_y:
-            logger.info(
-                'Applying gate2 ROI coordinate offset | source_offset=(%.2f, %.2f) | frame_offset=(%.2f, %.2f)',
-                offset_x,
-                offset_y,
-                scaled_offset_x,
-                scaled_offset_y,
-            )
-            max_x, max_y = max(frame_width - 1, 0), max(frame_height - 1, 0)
-            self.rois = {
-                name: [
-                    (
-                        float(min(max(int(round(x + scaled_offset_x)), 0), max_x)),
-                        float(min(max(int(round(y + scaled_offset_y)), 0), max_y)),
-                    )
-                    for x, y in points
-                ]
-                for name, points in self.rois.items()
-            }
         self.roi_points = self.rois[self.roi_name]
         self.roi_area = self._polygon_area(self.roi_points)
         if self.roi_area <= 0:
