@@ -291,3 +291,6 @@ uv run pytest
 - Prefer caster-specific config through `resolve_enabled_casters`.
 - Use the state JSON files in `outputs/state` to debug what happened during a run.
 - Use `--test` before changing email behavior in production.
+
+Systemd maintenance for the 10-minute Gate 2 closed-position alert job is documented in
+[`docs/gate2-closed-position-systemd.md`](docs/gate2-closed-position-systemd.md).
