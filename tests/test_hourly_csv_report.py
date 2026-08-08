@@ -149,6 +149,43 @@ class HourlyExporterBoundaryTest(TestCase):
         self.assertEqual(len(frame), 2)
         self.assertEqual(window_end, datetime(2026, 8, 8, 2, 0))
 
+    def test_trolley_window_includes_start_and_excludes_stop(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "pipes.db"
+            with closing(sqlite3.connect(db_path)) as con:
+                con.execute(
+                    """
+                    CREATE TABLE trolley_gate2_intersections (
+                        timestamp REAL,
+                        trolley_track_id INTEGER,
+                        pipe_on_trolley INTEGER
+                    )
+                    """
+                )
+                for track_id, event_time in (
+                    (1, datetime(2026, 8, 8, 1, 0)),
+                    (2, datetime(2026, 8, 8, 1, 30)),
+                    (3, datetime(2026, 8, 8, 2, 0)),
+                ):
+                    con.execute(
+                        """
+                        INSERT INTO trolley_gate2_intersections(
+                            timestamp, trolley_track_id, pipe_on_trolley
+                        ) VALUES (?, ?, 1)
+                        """,
+                        (int(event_time.timestamp()), track_id),
+                    )
+                con.commit()
+
+            exporter = object.__new__(VerifiedPipeExporter)
+            exporter.db_path = db_path
+            frame = exporter._fetch_trolley_intersections_window(
+                datetime(2026, 8, 8, 1, 0),
+                datetime(2026, 8, 8, 2, 0),
+            )
+
+        self.assertEqual(frame["trolley_track_id"].tolist(), [1, 2])
+
 
 class HourlyCsvWorkflowTest(TestCase):
     def test_sends_only_consolidated_raw_and_verified_csv_emails(self):

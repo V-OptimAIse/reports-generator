@@ -31,7 +31,7 @@ caster_number: 2
 gate2_closed_position_report:
   interval_minutes: 10
   recent_window_minutes: 10
-  min_avg_coverage_percent: 80
+  min_avg_coverage_percent: 70
   roi_name: roi_gate2_closed
   gate2_class_id: 3
   source_resolution:
@@ -72,6 +72,7 @@ verified_pipe_records_recipients:
   - info@v-optimai.com
   - srinukotaru@electrosteel.com
 
+
 email:
   smtp_server: smtp.gmail.com
   send_csv_attachment: true   # true = attach CSV mail, false = skip attachment mail
@@ -89,15 +90,16 @@ email:
   # Used by --test; production, diagnosis, and verified lists are not used in test mode.
   test_recipients:
     - karikutisasikumar1301@gmail.com
+    - punithsai2001@gmail.com
   # Diagnosis CSV is sent only to this list. Keep [] to skip diagnosis email.
-  diagnosis_recipients: 
+  diagnosis_recipients:
     - punithsai2001@gmail.com
     - karikutisasikumar1301@gmail.com
     - info@v-optimai.com
     - shyamsundar.pilli@v-optimai.com
     - aakashpalina2019@gmail.com
     - sridharcharanchekka@gmail.com
-  
+
 video:
   fps: 10
   codec: mp4v
@@ -192,3 +194,4 @@ casters:
       var_dir: ../electrosteel_pipe_detection_prod/var/caster_8
       rois:
         path: ../electrosteel_pipe_detection_prod/config/casters/caster_8/rois.yaml
+        

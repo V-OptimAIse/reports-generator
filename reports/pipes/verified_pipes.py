@@ -25,11 +25,12 @@ class VerifiedPipeExporter:
     Creates a client-facing pipe CSV after removing unverified pipe records.
 
     Current mode:
-        loadcell - checkpoint/G2 verification is applied only to rows
-                   missing loadcell entry and/or exit time.
+        loadcell - checkpoint/trolley/G2 verification is applied only to rows
+                   missing loadcell entry and/or exit time. The fallback order is
+                   pipe checkpoint, pipe-on-trolley Gate 2 intersection, then G2 open.
 
     Future mode:
-        all      - checkpoint + gate verification is applied to every pipe row.
+        all      - the same verification sequence is applied to every pipe row.
     """
 
     IST_OFFSET = ("+5 hours", "+30 minutes")
@@ -39,6 +40,7 @@ class VerifiedPipeExporter:
     LOADCELL_COLUMNS = ("t_loadcell_enter", "t_loadcell_exit")
     GATE_OPEN_COLUMNS = ("t_open_IST", "t_gate1_open_IST", "t_gate2_open_IST")
     GATE2_OPEN_COLUMNS = ("t_gate2_open_IST",)
+    TROLLEY_TIMESTAMP_COLUMNS = ("timestamp_IST", "trolley_gate2_timestamp_IST")
     DEFAULT_GATE_OPEN_MAX_INTERVAL_SECONDS = 120
     CLIENT_COLUMNS = ("Pipe Number", "Origin Time")
 
@@ -138,6 +140,12 @@ class VerifiedPipeExporter:
     def _empty_gate_events_df() -> pd.DataFrame:
         return pd.DataFrame(columns=["gate_name", "t_open", "t_open_IST"])
 
+    @staticmethod
+    def _empty_trolley_intersections_df() -> pd.DataFrame:
+        return pd.DataFrame(
+            columns=["timestamp", "timestamp_IST", "trolley_track_id", "pipe_on_trolley"]
+        )
+
     def _build_gate_openings_query(
         self,
         table_name: str,
@@ -168,6 +176,21 @@ class VerifiedPipeExporter:
         FROM gate_cycles
         WHERE t_gate2_open >= ? AND t_gate2_open {end_operator} ?
         ORDER BY t_gate2_open;
+        """
+
+    def _build_trolley_intersections_query(self, *, inclusive_end: bool = True) -> str:
+        h, m = self.IST_OFFSET
+        end_operator = "<=" if inclusive_end else "<"
+        return f"""
+        SELECT
+            timestamp,
+            datetime(timestamp,'unixepoch','{h}','{m}') AS timestamp_IST,
+            trolley_track_id,
+            pipe_on_trolley
+        FROM trolley_gate2_intersections
+        WHERE timestamp >= ? AND timestamp {end_operator} ?
+          AND pipe_on_trolley = 1
+        ORDER BY timestamp;
         """
 
     def _fetch_gate_events_between(
@@ -237,6 +260,50 @@ class VerifiedPipeExporter:
             inclusive_end=False,
         )
         return gate_df, stop_dt
+
+    def _fetch_trolley_intersections_between(
+        self,
+        start_ts: int,
+        end_ts: int,
+        *,
+        inclusive_end: bool,
+    ) -> pd.DataFrame:
+        if not self.db_path.exists():
+            raise FileNotFoundError(f"Database not found: {self.db_path}")
+
+        with closing(sqlite3.connect(self.db_path)) as con:
+            if not self._table_exists(con, "trolley_gate2_intersections"):
+                logger.info(
+                    "No trolley_gate2_intersections table found; using checkpoint/G2 verification | db=%s",
+                    self.db_path,
+                )
+                return self._empty_trolley_intersections_df()
+            return pd.read_sql_query(
+                self._build_trolley_intersections_query(inclusive_end=inclusive_end),
+                con,
+                params=(start_ts, end_ts),
+            )
+
+    def _fetch_trolley_intersections_df(self, date_str: str, shift: str) -> pd.DataFrame:
+        start_ts, end_ts, _start_dt, _end_dt = self._shift_window(date_str, shift)
+        return self._fetch_trolley_intersections_between(
+            start_ts,
+            end_ts,
+            inclusive_end=True,
+        )
+
+    def _fetch_trolley_intersections_window(
+        self,
+        start_dt: datetime,
+        stop_dt: datetime,
+    ) -> pd.DataFrame:
+        if stop_dt <= start_dt:
+            raise ValueError("Report stop time must be after start time")
+        return self._fetch_trolley_intersections_between(
+            int(start_dt.timestamp()),
+            int(stop_dt.timestamp()),
+            inclusive_end=False,
+        )
 
     @staticmethod
     def _missing_mask(series: pd.Series) -> pd.Series:
@@ -322,6 +389,75 @@ class VerifiedPipeExporter:
             .sort_values(ignore_index=True)
         )
 
+    @staticmethod
+    def _truthy_mask(series: pd.Series) -> pd.Series:
+        truthy_text = series.astype("string").str.strip().str.lower().isin({"1", "true", "yes"})
+        return pd.to_numeric(series, errors="coerce").eq(1) | truthy_text
+
+    def _trolley_pipe_times(self, trolley_df: pd.DataFrame | None) -> pd.Series:
+        if trolley_df is None or trolley_df.empty:
+            return pd.Series(dtype="datetime64[ns]")
+
+        work = trolley_df
+        if "pipe_on_trolley" in work.columns:
+            work = work.loc[self._truthy_mask(work["pipe_on_trolley"])]
+        if work.empty:
+            return pd.Series(dtype="datetime64[ns]")
+
+        parsed = [
+            self._parse_datetime_series(work[column])
+            for column in self.TROLLEY_TIMESTAMP_COLUMNS
+            if column in work.columns
+        ]
+        if "timestamp" in work.columns:
+            unix_timestamp = pd.to_numeric(work["timestamp"], errors="coerce")
+            if unix_timestamp.notna().any():
+                parsed.append(
+                    pd.to_datetime(unix_timestamp, unit="s", errors="coerce", utc=True)
+                    .dt.tz_convert("Asia/Kolkata")
+                    .dt.tz_localize(None)
+                )
+            else:
+                parsed.append(self._parse_datetime_series(work["timestamp"]))
+
+        if not parsed:
+            raise ValueError(
+                "Trolley intersections must include timestamp or timestamp_IST"
+            )
+        return (
+            pd.concat(parsed, ignore_index=True)
+            .dropna()
+            .drop_duplicates()
+            .sort_values(ignore_index=True)
+        )
+
+    @staticmethod
+    def _events_in_pipe_windows(
+        work: pd.DataFrame,
+        eligible_mask: pd.Series,
+        event_times: pd.Series,
+    ) -> pd.Series:
+        matched = pd.Series(False, index=work.index)
+        checked = work.loc[
+            eligible_mask,
+            ["_verified_t_origin", "_verified_window_end"],
+        ].dropna()
+        checked = checked.loc[
+            checked["_verified_window_end"] > checked["_verified_t_origin"]
+        ]
+        event_values = event_times.to_numpy(dtype="datetime64[ns]")
+        if not len(event_values) or checked.empty:
+            return matched
+
+        starts = checked["_verified_t_origin"].to_numpy(dtype="datetime64[ns]")
+        ends = checked["_verified_window_end"].to_numpy(dtype="datetime64[ns]")
+        positions = np.searchsorted(event_values, starts, side="left")
+        matches = positions < len(event_values)
+        valid = np.flatnonzero(matches)
+        matches[valid] = event_values[positions[valid]] < ends[valid]
+        matched.loc[checked.index] = matches
+        return matched
+
     def _loadcell_missing_mask(self, pipe_df: pd.DataFrame) -> pd.Series:
         missing_columns = [c for c in self.LOADCELL_COLUMNS if c not in pipe_df.columns]
         if missing_columns:
@@ -335,9 +471,7 @@ class VerifiedPipeExporter:
     def _pipe_checkpoint_mask(self, pipe_df: pd.DataFrame) -> pd.Series:
         if self.CHECKPOINT_COLUMN not in pipe_df.columns:
             return pd.Series(False, index=pipe_df.index)
-        values = pipe_df[self.CHECKPOINT_COLUMN]
-        truthy_text = values.astype("string").str.strip().str.lower().isin({"true", "yes"})
-        return pd.to_numeric(values, errors="coerce").eq(1) | truthy_text
+        return self._truthy_mask(pipe_df[self.CHECKPOINT_COLUMN])
 
     def _add_loadcell_missing_columns(self, pipe_df: pd.DataFrame) -> pd.DataFrame:
         missing_columns = [c for c in self.LOADCELL_COLUMNS if c not in pipe_df.columns]
@@ -388,6 +522,7 @@ class VerifiedPipeExporter:
         self,
         pipe_df: pd.DataFrame,
         gate_df: pd.DataFrame,
+        trolley_df: pd.DataFrame | None = None,
         *,
         mode: str,
         shift_end: datetime | None,
@@ -421,28 +556,30 @@ class VerifiedPipeExporter:
             axis=1,
         ).min(axis=1)
 
+        trolley_pipe_times = self._trolley_pipe_times(trolley_df)
         gate2_times = self._gate2_open_times(gate_df)
 
         verify_mask = pd.Series(mode == "all", index=work.index)
         if mode == "loadcell":
             verify_mask = work["_verified_missing_loadcell"].copy()
 
-        gate_fallback_mask = verify_mask & ~work["_verified_pipe_checkpoint"]
-        has_gate2_open = pd.Series(False, index=work.index)
-        checked = work.loc[gate_fallback_mask, ["_verified_t_origin", "_verified_window_end"]].dropna()
-        checked = checked.loc[checked["_verified_window_end"] > checked["_verified_t_origin"]]
-        gate_values = gate2_times.to_numpy(dtype="datetime64[ns]")
-        if len(gate_values) and not checked.empty:
-            starts = checked["_verified_t_origin"].to_numpy(dtype="datetime64[ns]")
-            ends = checked["_verified_window_end"].to_numpy(dtype="datetime64[ns]")
-            positions = np.searchsorted(gate_values, starts, side="left")
-            matches = positions < len(gate_values)
-            matches[matches] = gate_values[positions[matches]] < ends[matches]
-            has_gate2_open.loc[checked.index] = matches
-
         confirmed_by_checkpoint = verify_mask & work["_verified_pipe_checkpoint"]
+        trolley_fallback_mask = verify_mask & ~work["_verified_pipe_checkpoint"]
+        has_pipe_on_trolley = self._events_in_pipe_windows(
+            work,
+            trolley_fallback_mask,
+            trolley_pipe_times,
+        )
+        confirmed_by_trolley = trolley_fallback_mask & has_pipe_on_trolley
+
+        gate_fallback_mask = trolley_fallback_mask & ~has_pipe_on_trolley
+        has_gate2_open = self._events_in_pipe_windows(
+            work,
+            gate_fallback_mask,
+            gate2_times,
+        )
         confirmed_by_gate2 = gate_fallback_mask & has_gate2_open
-        confirmed_mask = confirmed_by_checkpoint | confirmed_by_gate2
+        confirmed_mask = confirmed_by_checkpoint | confirmed_by_trolley | confirmed_by_gate2
         keep_mask = ~verify_mask | confirmed_mask
         removed_df = work.loc[~keep_mask]
         verified_df = (
@@ -469,18 +606,26 @@ class VerifiedPipeExporter:
             "verified_count": int(len(verified_df)),
             "removed_count": int(len(removed_df)),
             "loadcell_missing_count": int(work["_verified_missing_loadcell"].sum()),
+            "trolley_pipe_intersection_count": int(len(trolley_pipe_times)),
             "gate_open_count": int(len(gate2_times)),
             "gate2_open_count": int(len(gate2_times)),
             "gate_open_max_interval_seconds": int(max_interval_seconds),
             "checked_count": int(verify_mask.sum()),
+            "trolley_fallback_checked_count": int(trolley_fallback_mask.sum()),
             "gate_fallback_checked_count": int(gate_fallback_mask.sum()),
             "confirmed_by_checkpoint_count": int(confirmed_by_checkpoint.sum()),
+            "confirmed_by_trolley_count": int(confirmed_by_trolley.sum()),
+            "confirmed_by_trolley_gate2_intersection_count": int(confirmed_by_trolley.sum()),
             "confirmed_by_gate_count": int(confirmed_by_gate2.sum()),
             "confirmed_by_gate2_count": int(confirmed_by_gate2.sum()),
             "confirmed_by_checkpoint_and_gate_count": int(confirmed_mask.sum()),
+            "confirmed_by_any_method_count": int(confirmed_mask.sum()),
             "pipe_checkpoint_count": int(work["_verified_pipe_checkpoint"].sum()),
             "checkpoint_unconfirmed_count": int(
                 (verify_mask & ~work["_verified_pipe_checkpoint"]).sum()
+            ),
+            "trolley_unconfirmed_count": int(
+                (trolley_fallback_mask & ~has_pipe_on_trolley).sum()
             ),
             "gate_unconfirmed_count": int((gate_fallback_mask & ~has_gate2_open).sum()),
             "gate2_unconfirmed_count": int((gate_fallback_mask & ~has_gate2_open).sum()),
@@ -516,11 +661,13 @@ class VerifiedPipeExporter:
         mode = self._normalize_mode(mode or configured_mode)
 
         gate_df, shift_end = self._fetch_gate_events_df(date_str, shift)
+        trolley_df = self._fetch_trolley_intersections_df(date_str, shift)
         return self.export_from_dataframes(
             date_str,
             shift,
             pd.read_csv(pipes_csv_path),
             gate_df,
+            trolley_df=trolley_df,
             mode=mode,
             shift_end=shift_end,
         )
@@ -541,12 +688,14 @@ class VerifiedPipeExporter:
         )
         mode = self._normalize_mode(mode or configured_mode)
         gate_df, window_end = self._fetch_gate_events_window(start_dt, stop_dt)
+        trolley_df = self._fetch_trolley_intersections_window(start_dt, stop_dt)
         window_token = self._window_file_token(start_dt, stop_dt)
         out_path, summary = self.export_from_dataframes(
             start_dt.strftime("%d-%m-%Y"),
             window_token,
             pd.read_csv(pipes_csv_path),
             gate_df,
+            trolley_df=trolley_df,
             mode=mode,
             shift_end=window_end,
         )
@@ -593,12 +742,14 @@ class VerifiedPipeExporter:
         pipe_df: pd.DataFrame,
         gate_df: pd.DataFrame,
         *,
+        trolley_df: pd.DataFrame | None = None,
         mode: str,
         shift_end: datetime | None = None,
     ) -> tuple[Path, dict]:
         verified_df, summary = self._apply_gate_verification(
             pipe_df,
             gate_df,
+            trolley_df,
             mode=mode,
             shift_end=shift_end,
         )

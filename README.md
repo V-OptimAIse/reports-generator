@@ -95,7 +95,8 @@ For each enabled or selected caster, the workflow runs these phases in order.
 3. Creates or updates a state file in `outputs/state`.
 4. Exports the raw pipe CSV from the caster SQLite database.
 5. Emails the raw CSV if `email.send_csv_attachment` is enabled.
-6. Creates the verified pipe CSV.
+6. Creates the verified pipe CSV using checkpoint, trolley/Gate 2 intersection,
+   then Gate 2 opening as the fallback sequence for rows requiring verification.
 7. Emails the verified pipe CSV to `verified_pipe_records_recipients`.
 8. Uploads the raw CSV to Google Drive through `rclone`.
 9. Deletes the local raw CSV after successful Drive upload.
@@ -236,7 +237,10 @@ reports/pipes/verified_pipes.py
 ```
 
 Creates client-facing verified pipe CSVs. It can verify only loadcell-missing
-rows or all rows, depending on `verified_pipes_mode`.
+rows or all rows, depending on `verified_pipes_mode`. A checked row is confirmed
+first by `pipe_checkpoint=1`, then by a `pipe_on_trolley=1` event from
+`trolley_gate2_intersections`, and finally by a Gate 2 opening in the pipe's
+verification window.
 
 ```text
 reports/pipes/gate_cycles_exporter.py

@@ -375,7 +375,10 @@ class ShiftWorkflow:
             return "N/A"
         window_seconds = verified_summary.get("gate_open_max_interval_seconds")
         window_text = self._format_seconds_hms(window_seconds) if window_seconds is not None else "configured window"
-        return f"Pipe checkpoint was not 1 and G2 was not open within {window_text} from T-Origin"
+        return (
+            "Pipe checkpoint was not 1, no pipe-on-trolley Gate 2 intersection was "
+            f"recorded, and G2 was not open within {window_text} from T-Origin"
+        )
 
     def _missing_loadcell_video_cfg(self, cfg: dict) -> dict:
         video_cfg = cfg.get("missing_loadcell_video", {}) or {}
