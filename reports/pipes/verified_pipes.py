@@ -2,6 +2,7 @@ import argparse
 import logging
 import sqlite3
 import sys
+from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -137,20 +138,27 @@ class VerifiedPipeExporter:
     def _empty_gate_events_df() -> pd.DataFrame:
         return pd.DataFrame(columns=["gate_name", "t_open", "t_open_IST"])
 
-    def _build_gate_openings_query(self, table_name: str) -> str:
+    def _build_gate_openings_query(
+        self,
+        table_name: str,
+        *,
+        inclusive_end: bool = True,
+    ) -> str:
         h, m = self.IST_OFFSET
+        end_operator = "<=" if inclusive_end else "<"
         return f"""
         SELECT
             gate_name,
             t_open,
             datetime(t_open,'unixepoch','{h}','{m}') AS t_open_IST
         FROM {table_name}
-        WHERE t_open BETWEEN ? AND ?
+        WHERE t_open >= ? AND t_open {end_operator} ?
         ORDER BY t_open;
         """
 
-    def _build_gate_cycles_query(self) -> str:
+    def _build_gate_cycles_query(self, *, inclusive_end: bool = True) -> str:
         h, m = self.IST_OFFSET
+        end_operator = "<=" if inclusive_end else "<"
         return f"""
         SELECT
             'gate2' AS gate_name,
@@ -158,33 +166,43 @@ class VerifiedPipeExporter:
             datetime(t_gate2_open,'unixepoch','{h}','{m}') AS t_open_IST,
             datetime(t_gate2_open,'unixepoch','{h}','{m}') AS t_gate2_open_IST
         FROM gate_cycles
-        WHERE t_gate2_open BETWEEN ? AND ?
+        WHERE t_gate2_open >= ? AND t_gate2_open {end_operator} ?
         ORDER BY t_gate2_open;
         """
 
-    def _fetch_gate_events_df(self, date_str: str, shift: str) -> tuple[pd.DataFrame, datetime]:
-        start_ts, end_ts, _start_dt, end_dt = self._shift_window(date_str, shift)
-
+    def _fetch_gate_events_between(
+        self,
+        start_ts: int,
+        end_ts: int,
+        *,
+        inclusive_end: bool,
+    ) -> pd.DataFrame:
         if not self.db_path.exists():
             raise FileNotFoundError(f"Database not found: {self.db_path}")
 
-        with sqlite3.connect(self.db_path) as con:
+        with closing(sqlite3.connect(self.db_path)) as con:
             gate_df = None
             if self._table_exists(con, "gate_openings"):
                 gate_df = pd.read_sql_query(
-                    self._build_gate_openings_query("gate_openings"),
+                    self._build_gate_openings_query(
+                        "gate_openings",
+                        inclusive_end=inclusive_end,
+                    ),
                     con,
                     params=(start_ts, end_ts),
                 )
             if (gate_df is None or gate_df.empty) and self._table_exists(con, "gate_open_events"):
                 gate_df = pd.read_sql_query(
-                    self._build_gate_openings_query("gate_open_events"),
+                    self._build_gate_openings_query(
+                        "gate_open_events",
+                        inclusive_end=inclusive_end,
+                    ),
                     con,
                     params=(start_ts, end_ts),
                 )
             if (gate_df is None or gate_df.empty) and self._table_exists(con, "gate_cycles"):
                 gate_df = pd.read_sql_query(
-                    self._build_gate_cycles_query(),
+                    self._build_gate_cycles_query(inclusive_end=inclusive_end),
                     con,
                     params=(start_ts, end_ts),
                 )
@@ -195,7 +213,30 @@ class VerifiedPipeExporter:
                 )
                 gate_df = self._empty_gate_events_df()
 
+        return gate_df
+
+    def _fetch_gate_events_df(self, date_str: str, shift: str) -> tuple[pd.DataFrame, datetime]:
+        start_ts, end_ts, _start_dt, end_dt = self._shift_window(date_str, shift)
+        gate_df = self._fetch_gate_events_between(
+            start_ts,
+            end_ts,
+            inclusive_end=True,
+        )
         return gate_df, end_dt
+
+    def _fetch_gate_events_window(
+        self,
+        start_dt: datetime,
+        stop_dt: datetime,
+    ) -> tuple[pd.DataFrame, datetime]:
+        if stop_dt <= start_dt:
+            raise ValueError("Report stop time must be after start time")
+        gate_df = self._fetch_gate_events_between(
+            int(start_dt.timestamp()),
+            int(stop_dt.timestamp()),
+            inclusive_end=False,
+        )
+        return gate_df, stop_dt
 
     @staticmethod
     def _missing_mask(series: pd.Series) -> pd.Series:
@@ -483,6 +524,41 @@ class VerifiedPipeExporter:
             mode=mode,
             shift_end=shift_end,
         )
+
+    def export_window(
+        self,
+        start_dt: datetime,
+        stop_dt: datetime,
+        pipes_csv_path: str | Path,
+        *,
+        mode: str | None = None,
+    ) -> tuple[Path, dict]:
+        """Export verified pipes for a half-open custom window."""
+        configured_mode = (
+            self.cfg.get("verified_pipes_mode")
+            or self.cfg.get("verfied_pipes_mode")
+            or "loadcell"
+        )
+        mode = self._normalize_mode(mode or configured_mode)
+        gate_df, window_end = self._fetch_gate_events_window(start_dt, stop_dt)
+        window_token = self._window_file_token(start_dt, stop_dt)
+        out_path, summary = self.export_from_dataframes(
+            start_dt.strftime("%d-%m-%Y"),
+            window_token,
+            pd.read_csv(pipes_csv_path),
+            gate_df,
+            mode=mode,
+            shift_end=window_end,
+        )
+        summary["window_start"] = start_dt.isoformat(timespec="seconds")
+        summary["window_stop"] = stop_dt.isoformat(timespec="seconds")
+        return out_path, summary
+
+    @staticmethod
+    def _window_file_token(start_dt: datetime, stop_dt: datetime) -> str:
+        if start_dt.date() == stop_dt.date():
+            return f"window_{start_dt:%H%M%S}_{stop_dt:%H%M%S}"
+        return f"window_{start_dt:%H%M%S}_{stop_dt:%d%m%Y_%H%M%S}"
 
     def export_from_csvs(
         self,

@@ -3,6 +3,7 @@ import pandas as pd
 import yaml
 import logging
 import zipfile
+from contextlib import closing
 from pathlib import Path
 from datetime import datetime, timedelta
 from xml.sax.saxutils import escape
@@ -156,13 +157,19 @@ class PipeExporter:
         rows = con.execute(f"PRAGMA table_info({table_name})").fetchall()
         return {str(row[1]) for row in rows}
 
-    def _build_query(self, pipe_columns: set[str] | None = None):
+    def _build_query(
+        self,
+        pipe_columns: set[str] | None = None,
+        *,
+        inclusive_end: bool = True,
+    ):
         h, m = self.IST_OFFSET
         pipe_checkpoint_expr = (
             "pipe_checkpoint"
             if pipe_columns is None or "pipe_checkpoint" in pipe_columns
             else "0 AS pipe_checkpoint"
         )
+        end_operator = "<=" if inclusive_end else "<"
         return f"""
         SELECT
             pipe_uid,
@@ -177,18 +184,39 @@ class PipeExporter:
             state,
             datetime(last_seen_ts,'unixepoch','{h}','{m}') AS last_seen_ts
         FROM pipes
-        WHERE t_origin BETWEEN ? AND ?
+        WHERE t_origin >= ? AND t_origin {end_operator} ?
         ORDER BY t_origin DESC;
         """
 
     def _fetch_shift_df(self, date_str: str, shift: str):
         start_ts, end_ts, start_dt, end_dt = self._shift_window(date_str, shift)
 
-        with sqlite3.connect(self.db_path) as con:
+        with closing(sqlite3.connect(self.db_path)) as con:
             query = self._build_query(self._table_columns(con, "pipes"))
             df = pd.read_sql_query(query, con, params=(start_ts, end_ts))
 
         return df, start_dt, end_dt
+
+    def _fetch_window_df(self, start_dt: datetime, stop_dt: datetime):
+        if stop_dt <= start_dt:
+            raise ValueError("Report stop time must be after start time")
+
+        start_ts = int(start_dt.timestamp())
+        stop_ts = int(stop_dt.timestamp())
+        with closing(sqlite3.connect(self.db_path)) as con:
+            query = self._build_query(
+                self._table_columns(con, "pipes"),
+                inclusive_end=False,
+            )
+            df = pd.read_sql_query(query, con, params=(start_ts, stop_ts))
+
+        return df
+
+    @staticmethod
+    def _window_file_token(start_dt: datetime, stop_dt: datetime) -> str:
+        if start_dt.date() == stop_dt.date():
+            return f"window_{start_dt:%H%M%S}_{stop_dt:%H%M%S}"
+        return f"window_{start_dt:%H%M%S}_{stop_dt:%d%m%Y_%H%M%S}"
 
     @staticmethod
     def _format_duration(seconds):
@@ -519,5 +547,28 @@ class PipeExporter:
         logger.info(
             "PIPE REPORT | shift=%s | from=%s | to=%s | pipe_count=%s | saved=%s",
             shift.upper(), start_dt, end_dt, pipe_count, out_path
+        )
+        return out_path, pipe_count
+
+    def export_window(self, start_dt: datetime, stop_dt: datetime):
+        """Export raw pipes for a half-open custom window: start <= t_origin < stop."""
+        logger.info("Fetching pipe data (from=%s, to=%s)...", start_dt, stop_dt)
+        df = self._fetch_window_df(start_dt, stop_dt)
+
+        timestamp = datetime.now().strftime("%H%M%S")
+        date_str = start_dt.strftime("%d-%m-%Y")
+        window_token = self._window_file_token(start_dt, stop_dt)
+        filename = self._filename("pipes", date_str, window_token, timestamp, "csv")
+        out_path = self.output_dir / filename
+        df.to_csv(out_path, index=False)
+
+        pipe_count = int(len(df))
+        self.pipe_count = pipe_count
+        logger.info(
+            "PIPE WINDOW REPORT | from=%s | to=%s | pipe_count=%s | saved=%s",
+            start_dt,
+            stop_dt,
+            pipe_count,
+            out_path,
         )
         return out_path, pipe_count

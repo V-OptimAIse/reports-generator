@@ -42,6 +42,50 @@ uv run python -m cli.report_workflow --date 13-07-2026 --shift C --test
 
 `--test` sends workflow emails only to `email.test_recipients`.
 
+## Hourly Raw and Verified CSV Reports
+
+The hourly CSV workflow is separate from the shift workflow. It creates and emails
+only the raw CSV and verified CSV; it does not create XLSX/video files, upload to
+Drive, or delete history sources.
+
+Run a specific window for one caster:
+
+```bash
+uv run python -m cli.hourly_csv_report --date 08-08-2026 --start 01:00 --stop 02:00 --caster caster3
+```
+
+Run a specific window for all enabled casters:
+
+```bash
+uv run python -m cli.hourly_csv_report --date 08-08-2026 --start 01:00 --stop 02:00 --all-casters
+```
+
+When `--date`, `--start`, and `--stop` are omitted, the command automatically uses
+the previous completed clock hour. This is the recommended systemd command:
+
+```bash
+uv run python -m cli.hourly_csv_report --all-casters
+```
+
+Useful safety and retry options:
+
+```bash
+uv run python -m cli.hourly_csv_report --date 08-08-2026 --start 01:00 --stop 02:00 --caster caster3 --no-email
+uv run python -m cli.hourly_csv_report --date 08-08-2026 --start 01:00 --stop 02:00 --caster caster3 --test
+uv run python -m cli.hourly_csv_report --date 08-08-2026 --start 01:00 --stop 02:00 --caster caster3 --force
+```
+
+Hourly windows are half-open: `01:00 <= event time < 02:00`. This prevents the
+02:00 record from appearing in both the 01:00-02:00 and 02:00-03:00 reports.
+Successful windows are recorded under `outputs/state/hourly`, so a repeated systemd
+activation does not resend the same report. Use `--force` only when an intentional
+resend is required.
+
+Raw hourly mail uses `email.recipients`; verified hourly mail uses
+`verified_pipe_records_recipients`. Optional `hourly_csv_report.raw_recipients` and
+`hourly_csv_report.verified_recipients` values can override those lists without
+changing shift-report recipients.
+
 ## What The Full Workflow Does
 
 For each enabled or selected caster, the workflow runs these phases in order.
@@ -143,6 +187,13 @@ cli/report_workflow.py
 
 Main multi-caster workflow. Handles scheduled/manual runs, state, emails, uploads,
 diagnosis, missing-loadcell videos, full-shift videos, and source cleanup.
+
+```text
+cli/hourly_csv_report.py
+```
+
+Generates and emails only raw and verified CSVs for an explicit time window or the
+previous completed hour. Its state and email flow are isolated from shift reports.
 
 ```text
 cli/generate_report.py
@@ -294,3 +345,6 @@ uv run pytest
 
 Systemd maintenance for the 10-minute Gate 2 closed-position alert job is documented in
 [`docs/gate2-closed-position-systemd.md`](docs/gate2-closed-position-systemd.md).
+
+Systemd setup for hourly raw and verified CSV mail is documented in
+[`docs/hourly-csv-report-systemd.md`](docs/hourly-csv-report-systemd.md).
