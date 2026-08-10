@@ -189,7 +189,7 @@ class HourlyExporterBoundaryTest(TestCase):
 
 
 class HourlyCsvWorkflowTest(TestCase):
-    def test_verified_email_uses_shift_table_with_enabled_casters_and_saved_counts(self):
+    def test_verified_email_uses_html_table_with_enabled_casters_and_saved_counts(self):
         with TemporaryDirectory() as tmp:
             workflow = HourlyCsvWorkflow(cfg=_cfg())
             workflow.state_dir = Path(tmp) / "state"
@@ -219,45 +219,36 @@ class HourlyCsvWorkflowTest(TestCase):
                 current_results,
             )
 
-        self.assertEqual(
-            body,
-            "\n".join([
-                "Hourly Verified Pipe Production Report",
-                "",
-                "Date  : 08-08-2026",
-                "SHIFT : A",
-                "",
-                "+---------------+----------+----------+",
-                "| Time Interval | Caster 2 | Caster 3 |",
-                "+---------------+----------+----------+",
-                "| 6--7          | 0        | 12       |",
-                "+---------------+----------+----------+",
-                "| 7--8          | 12       | 14       |",
-                "+---------------+----------+----------+",
-                "| 8--9          | 16       | 16       |",
-                "+---------------+----------+----------+",
-                "| 9--10         |          |          |",
-                "+---------------+----------+----------+",
-                "| 10--11        |          |          |",
-                "+---------------+----------+----------+",
-                "| 11--12        |          |          |",
-                "+---------------+----------+----------+",
-                "| 12--13        |          |          |",
-                "+---------------+----------+----------+",
-                "| 13--14        |          |          |",
-                "+---------------+----------+----------+",
-                "| Total count   | 28       | 42       |",
-                "+---------------+----------+----------+",
-                "",
-                "2 CSV file(s) attached.",
-            ]),
-        )
+        self.assertTrue(body.startswith("<!doctype html>"))
+        self.assertIn("Hourly Verified Pipe Production Report</h1>", body)
+        self.assertIn("max-width:680px", body)
+        self.assertIn("font-family:Arial, Helvetica, sans-serif", body)
+        self.assertIn('<table role="table"', body)
+        self.assertIn(">Time Interval</th>", body)
+        self.assertIn(">Caster 2</th>", body)
+        self.assertIn(">Caster 3</th>", body)
+        self.assertIn(">06:00 – 07:00</td>", body)
+        self.assertIn(">13:00 – 14:00</td>", body)
+        self.assertIn(">Total Count</td>", body)
+        self.assertIn(">28</td>", body)
+        self.assertIn(">42</td>", body)
+        self.assertIn("2 CSV files attached</p>", body)
+        self.assertNotIn("+---------------+", body)
 
     def test_verified_email_builds_rows_for_all_three_configured_shifts(self):
         cases = (
-            ("08-08-2026", "06:00", "07:00", "08-08-2026", "A", "6--7", "13--14"),
-            ("08-08-2026", "14:00", "15:00", "08-08-2026", "B", "14--15", "21--22"),
-            ("09-08-2026", "01:00", "02:00", "08-08-2026", "C", "22--23", "5--6"),
+            (
+                "08-08-2026", "06:00", "07:00", "08-08-2026", "A",
+                "06:00 – 07:00", "13:00 – 14:00",
+            ),
+            (
+                "08-08-2026", "14:00", "15:00", "08-08-2026", "B",
+                "14:00 – 15:00", "21:00 – 22:00",
+            ),
+            (
+                "09-08-2026", "01:00", "02:00", "08-08-2026", "C",
+                "22:00 – 23:00", "05:00 – 06:00",
+            ),
         )
         with TemporaryDirectory() as tmp:
             workflow = HourlyCsvWorkflow(cfg=_cfg(), selected_ids=["caster3"])
@@ -271,12 +262,11 @@ class HourlyCsvWorkflowTest(TestCase):
                 with self.subTest(shift=shift_name):
                     window = HourlyWindow.from_cli(date_str, start, stop)
                     _, body = workflow._email_subject_and_body("verified", window, [result])
-                    lines = body.splitlines()
 
-                    self.assertIn(f"Date  : {shift_date}", lines)
-                    self.assertIn(f"SHIFT : {shift_name}", lines)
-                    self.assertTrue(any(line.startswith(f"| {first_row}") for line in lines))
-                    self.assertTrue(any(line.startswith(f"| {last_row}") for line in lines))
+                    self.assertIn(f">Date:</span> {shift_date}</td>", body)
+                    self.assertIn(f">Shift:</span> {shift_name}</td>", body)
+                    self.assertIn(f">{first_row}</td>", body)
+                    self.assertIn(f">{last_row}</td>", body)
 
     def test_raw_email_body_keeps_the_existing_window_format(self):
         workflow = HourlyCsvWorkflow(cfg=_cfg(), selected_ids=["caster3"])
@@ -320,10 +310,18 @@ class HourlyCsvWorkflowTest(TestCase):
                 def __init__(self, cfg=None):
                     pass
 
-                def send(self, subject, body, attachments=None, recipients=None):
+                def send(
+                    self,
+                    subject,
+                    body,
+                    attachments=None,
+                    recipients=None,
+                    html_body=None,
+                ):
                     sent_messages.append({
                         "subject": subject,
                         "body": body,
+                        "html_body": html_body,
                         "attachments": list(attachments or []),
                         "recipients": list(recipients or []),
                     })
@@ -350,8 +348,11 @@ class HourlyCsvWorkflowTest(TestCase):
         self.assertEqual(len(sent_messages), 2)
         self.assertIn("Hourly Raw Pipe", sent_messages[0]["subject"])
         self.assertEqual(sent_messages[0]["recipients"], ["raw@example.com"])
+        self.assertIsNone(sent_messages[0]["html_body"])
         self.assertIn("Hourly Verified Pipe", sent_messages[1]["subject"])
         self.assertEqual(sent_messages[1]["recipients"], ["verified@example.com"])
+        self.assertIn("<table", sent_messages[1]["html_body"])
+        self.assertNotIn("<table", sent_messages[1]["body"])
         self.assertEqual(state["status"], "success")
         self.assertTrue(state["raw_email_sent"])
         self.assertTrue(state["verified_email_sent"])

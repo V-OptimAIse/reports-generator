@@ -8,6 +8,7 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from html import escape
 from pathlib import Path
 from typing import Callable
 
@@ -115,6 +116,13 @@ class HourlyCasterResult:
     raw_count: int | str = 0
     verified_path: str | None = None
     verified_summary: dict | None = None
+
+
+@dataclass(frozen=True)
+class HourlyEmailContent:
+    subject: str
+    text_body: str
+    html_body: str | None = None
 
 
 class HourlyCsvWorkflow:
@@ -320,12 +328,12 @@ class HourlyCsvWorkflow:
         result.state["verified_exported"] = True
         self._save_state(window, result)
 
-    def _email_subject_and_body(
+    def _email_content(
         self,
         report_type: str,
         window: HourlyWindow,
         results: list[HourlyCasterResult],
-    ) -> tuple[str, str]:
+    ) -> HourlyEmailContent:
         report_name = "Raw Pipe" if report_type == "raw" else "Verified Pipe"
         subject = (
             f"Hourly {report_name} Production Report - "
@@ -335,7 +343,12 @@ class HourlyCsvWorkflow:
             subject = f"[TEST] {subject}"
 
         if report_type == "verified":
-            return subject, self._verified_shift_table_body(window, results)
+            text_body, html_body = self._verified_shift_email_bodies(window, results)
+            return HourlyEmailContent(
+                subject=subject,
+                text_body=text_body,
+                html_body=html_body,
+            )
 
         lines = [
             f"Hourly {report_name} Production Report",
@@ -344,13 +357,20 @@ class HourlyCsvWorkflow:
             "",
         ]
         for result in results:
-            if report_type == "raw":
-                count = result.raw_count
-            else:
-                count = (result.verified_summary or {}).get("verified_count", "N/A")
+            count = result.raw_count
             lines.append(f"{caster_label(result.caster, result.caster.cfg)} : {count}")
         lines.extend(["", f"{len(results)} CSV file(s) attached."])
-        return subject, "\n".join(lines)
+        return HourlyEmailContent(subject=subject, text_body="\n".join(lines))
+
+    def _email_subject_and_body(
+        self,
+        report_type: str,
+        window: HourlyWindow,
+        results: list[HourlyCasterResult],
+    ) -> tuple[str, str]:
+        """Compatibility helper returning the primary rendered body."""
+        content = self._email_content(report_type, window, results)
+        return content.subject, content.html_body or content.text_body
 
     def _shift_for_window(self, window: HourlyWindow) -> HourlyShift:
         configured = ((self.cfg.get("history", {}) or {}).get("shifts", []) or [])
@@ -379,28 +399,7 @@ class HourlyCsvWorkflow:
 
     @staticmethod
     def _interval_label(window: HourlyWindow) -> str:
-        def clock(value: datetime) -> str:
-            return str(value.hour) if value.minute == 0 else value.strftime("%H:%M")
-
-        return f"{clock(window.start)}--{clock(window.stop)}"
-
-    @staticmethod
-    def _format_text_table(headers: list[str], rows: list[list[str]]) -> list[str]:
-        widths = [
-            max(len(headers[index]), *(len(row[index]) for row in rows))
-            for index in range(len(headers))
-        ]
-
-        def format_row(row: list[str]) -> str:
-            cells = (f" {value.ljust(widths[index])} " for index, value in enumerate(row))
-            return f"|{'|'.join(cells)}|"
-
-        border = f"+{'+'.join('-' * (width + 2) for width in widths)}+"
-
-        lines = [border, format_row(headers), border]
-        for row in rows:
-            lines.extend([format_row(row), border])
-        return lines
+        return f"{window.start:%H:%M} – {window.stop:%H:%M}"
 
     def _verified_count_for_window(
         self,
@@ -420,15 +419,15 @@ class HourlyCsvWorkflow:
             return ""
         return str(summary["verified_count"])
 
-    def _verified_shift_table_body(
+    def _verified_shift_email_bodies(
         self,
         window: HourlyWindow,
         results: list[HourlyCasterResult],
-    ) -> str:
+    ) -> tuple[str, str]:
         shift = self._shift_for_window(window)
         current_results = {result.caster.id: result for result in results}
-        headers = ["Time Interval", *(caster_label(caster, caster.cfg) for caster in self.casters)]
-        rows = []
+        caster_labels = [caster_label(caster, caster.cfg) for caster in self.casters]
+        rows: list[tuple[str, list[str]]] = []
         totals = [0] * len(self.casters)
         has_counts = [False] * len(self.casters)
         for row_window in shift.windows:
@@ -447,22 +446,125 @@ class HourlyCsvWorkflow:
                     has_counts[index] = True
                 except (TypeError, ValueError):
                     continue
-            rows.append([self._interval_label(row_window), *counts])
-        rows.append([
-            "Total count",
-            *(str(total) if has_counts[index] else "" for index, total in enumerate(totals)),
-        ])
-        lines = [
+            rows.append((self._interval_label(row_window), counts))
+        total_values = [
+            str(total) if has_counts[index] else ""
+            for index, total in enumerate(totals)
+        ]
+        attachment_count = len(results)
+        attachment_text = (
+            f"{attachment_count} CSV "
+            f"{'file' if attachment_count == 1 else 'files'} attached"
+        )
+
+        text_lines = [
             "Hourly Verified Pipe Production Report",
             "",
-            f"Date  : {shift.start:%d-%m-%Y}",
-            f"SHIFT : {shift.display_name}",
+            f"Date: {shift.start:%d-%m-%Y}",
+            f"Shift: {shift.display_name}",
             "",
-            *self._format_text_table(headers, rows),
-            "",
-            f"{len(results)} CSV file(s) attached.",
         ]
-        return "\n".join(lines)
+        for interval, counts in rows:
+            values = ", ".join(
+                f"{label}: {count or '-'}"
+                for label, count in zip(caster_labels, counts)
+            )
+            text_lines.append(f"{interval} — {values}")
+        total_text = ", ".join(
+            f"{label}: {total or '-'}"
+            for label, total in zip(caster_labels, total_values)
+        )
+        text_lines.extend([
+            "",
+            f"Total Count — {total_text}",
+            "",
+            attachment_text,
+        ])
+
+        header_cells = "".join(
+            (
+                '<th align="left" style="padding:11px 12px; border:1px solid #cbd5e1; '
+                'background-color:#e8eef5; color:#17324d; font-size:13px; '
+                'font-weight:700; line-height:18px; text-align:left; white-space:nowrap;">'
+                'Time Interval</th>'
+                if index == 0
+                else '<th align="center" style="padding:11px 12px; border:1px solid #cbd5e1; '
+                'background-color:#e8eef5; color:#17324d; font-size:13px; '
+                'font-weight:700; line-height:18px; text-align:center; white-space:nowrap;">'
+                f'{escape(label)}</th>'
+            )
+            for index, label in enumerate(["Time Interval", *caster_labels])
+        )
+
+        data_rows = []
+        for row_index, (interval, counts) in enumerate(rows):
+            background = "#ffffff" if row_index % 2 == 0 else "#f7f9fc"
+            count_cells = "".join(
+                '<td align="center" style="padding:10px 12px; border:1px solid #d6dce3; '
+                f'background-color:{background}; color:#263746; font-size:13px; '
+                'line-height:18px; text-align:center;">'
+                f'{escape(count) if count else "&nbsp;"}</td>'
+                for count in counts
+            )
+            data_rows.append(
+                '<tr>'
+                '<td align="left" style="padding:10px 12px; border:1px solid #d6dce3; '
+                f'background-color:{background}; color:#263746; font-size:13px; '
+                'line-height:18px; text-align:left; white-space:nowrap;">'
+                f'{escape(interval)}</td>{count_cells}</tr>'
+            )
+
+        total_cells = "".join(
+            '<td align="center" style="padding:11px 12px; border:1px solid #b8c5d1; '
+            'background-color:#dfe8f1; color:#17324d; font-size:13px; font-weight:700; '
+            'line-height:18px; text-align:center;">'
+            f'{escape(total) if total else "&nbsp;"}</td>'
+            for total in total_values
+        )
+        total_row = (
+            '<tr><td align="left" style="padding:11px 12px; border:1px solid #b8c5d1; '
+            'background-color:#dfe8f1; color:#17324d; font-size:13px; font-weight:700; '
+            'line-height:18px; text-align:left; white-space:nowrap;">Total Count</td>'
+            f'{total_cells}</tr>'
+        )
+
+        html_body = (
+            '<!doctype html>'
+            '<html lang="en"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width, initial-scale=1.0">'
+            '<title>Hourly Verified Pipe Production Report</title></head>'
+            '<body style="margin:0; padding:0; background-color:#f2f5f8; '
+            'font-family:Arial, Helvetica, sans-serif; color:#263746;">'
+            '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" '
+            'style="width:100%; border-collapse:collapse; background-color:#f2f5f8;">'
+            '<tr><td align="center" style="padding:24px 12px;">'
+            '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" '
+            'style="width:100%; max-width:680px; border-collapse:separate; border-spacing:0; '
+            'background-color:#ffffff; border:1px solid #d9e0e7; border-radius:10px;">'
+            '<tr><td style="padding:28px 24px 24px 24px;">'
+            '<h1 style="margin:0 0 20px 0; color:#17324d; font-size:22px; font-weight:700; '
+            'line-height:29px;">Hourly Verified Pipe Production Report</h1>'
+            '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" '
+            'style="width:100%; margin:0 0 20px 0; border-collapse:collapse;">'
+            '<tr><td width="50%" style="padding:10px 12px; background-color:#f7f9fc; '
+            'border:1px solid #e0e5eb; color:#526474; font-size:13px; line-height:18px;">'
+            '<span style="font-weight:700; color:#17324d;">Date:</span> '
+            f'{escape(shift.start.strftime("%d-%m-%Y"))}</td>'
+            '<td width="50%" style="padding:10px 12px; background-color:#f7f9fc; '
+            'border:1px solid #e0e5eb; color:#526474; font-size:13px; line-height:18px;">'
+            '<span style="font-weight:700; color:#17324d;">Shift:</span> '
+            f'{escape(shift.display_name)}</td></tr></table>'
+            '<div style="width:100%; overflow-x:auto; border-radius:7px;">'
+            '<table role="table" width="100%" cellspacing="0" cellpadding="0" border="0" '
+            'style="width:100%; border-collapse:collapse; border-spacing:0;">'
+            f'<thead><tr>{header_cells}</tr></thead>'
+            f'<tbody>{"".join(data_rows)}{total_row}</tbody>'
+            '</table></div>'
+            '<p style="margin:18px 0 0 0; color:#617383; font-size:12px; line-height:18px;">'
+            f'{escape(attachment_text)}</p>'
+            '</td></tr></table></td></tr></table></body></html>'
+        )
+        return "\n".join(text_lines), html_body
 
     def _send_consolidated_email(
         self,
@@ -507,15 +609,20 @@ class HourlyCsvWorkflow:
                 self._record_error(window, result, reason)
             return False
 
-        subject, body = self._email_subject_and_body(report_type, window, valid_results)
+        content = self._email_content(report_type, window, valid_results)
+        send_kwargs = {
+            "attachments": attachments,
+            "recipients": recipients,
+        }
+        if content.html_body is not None:
+            send_kwargs["html_body"] = content.html_body
         try:
             mailer = EmailSender(cfg=valid_results[0].caster.cfg)
             self._retry(
                 lambda: mailer.send(
-                    subject,
-                    body,
-                    attachments=attachments,
-                    recipients=recipients,
+                    content.subject,
+                    content.text_body,
+                    **send_kwargs,
                 ),
                 what=f"hourly {report_type} CSV email",
             )

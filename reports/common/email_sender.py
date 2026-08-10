@@ -32,6 +32,7 @@ class EmailSender:
         body: str,
         attachments: list[str] | None = None,
         recipients: list[str] | None = None,
+        html_body: str | None = None,
     ):
         to_recipients = recipients if recipients is not None else self.recipients
         if not to_recipients:
@@ -42,6 +43,8 @@ class EmailSender:
         msg["From"] = self.sender
         msg["To"] = ", ".join(to_recipients)
         msg.set_content(body)
+        if html_body is not None:
+            msg.add_alternative(html_body, subtype="html")
 
         attachments = attachments or []
         for p in attachments:
