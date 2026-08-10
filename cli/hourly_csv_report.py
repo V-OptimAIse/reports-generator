@@ -392,13 +392,15 @@ class HourlyCsvWorkflow:
         ]
 
         def format_row(row: list[str]) -> str:
-            return " | ".join(value.ljust(widths[index]) for index, value in enumerate(row))
+            cells = (f" {value.ljust(widths[index])} " for index, value in enumerate(row))
+            return f"|{'|'.join(cells)}|"
 
-        return [
-            format_row(headers),
-            "-+-".join("-" * width for width in widths),
-            *(format_row(row) for row in rows),
-        ]
+        border = f"+{'+'.join('-' * (width + 2) for width in widths)}+"
+
+        lines = [border, format_row(headers), border]
+        for row in rows:
+            lines.extend([format_row(row), border])
+        return lines
 
     def _verified_count_for_window(
         self,

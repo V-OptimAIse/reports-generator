@@ -227,17 +227,27 @@ class HourlyCsvWorkflowTest(TestCase):
                 "Date  : 08-08-2026",
                 "SHIFT : A",
                 "",
-                "Time Interval | Caster 2 | Caster 3",
-                "--------------+----------+---------",
-                "6--7          | 0        | 12      ",
-                "7--8          | 12       | 14      ",
-                "8--9          | 16       | 16      ",
-                "9--10         |          |         ",
-                "10--11        |          |         ",
-                "11--12        |          |         ",
-                "12--13        |          |         ",
-                "13--14        |          |         ",
-                "Total count   | 28       | 42      ",
+                "+---------------+----------+----------+",
+                "| Time Interval | Caster 2 | Caster 3 |",
+                "+---------------+----------+----------+",
+                "| 6--7          | 0        | 12       |",
+                "+---------------+----------+----------+",
+                "| 7--8          | 12       | 14       |",
+                "+---------------+----------+----------+",
+                "| 8--9          | 16       | 16       |",
+                "+---------------+----------+----------+",
+                "| 9--10         |          |          |",
+                "+---------------+----------+----------+",
+                "| 10--11        |          |          |",
+                "+---------------+----------+----------+",
+                "| 11--12        |          |          |",
+                "+---------------+----------+----------+",
+                "| 12--13        |          |          |",
+                "+---------------+----------+----------+",
+                "| 13--14        |          |          |",
+                "+---------------+----------+----------+",
+                "| Total count   | 28       | 42       |",
+                "+---------------+----------+----------+",
                 "",
                 "2 CSV file(s) attached.",
             ]),
@@ -265,8 +275,8 @@ class HourlyCsvWorkflowTest(TestCase):
 
                     self.assertIn(f"Date  : {shift_date}", lines)
                     self.assertIn(f"SHIFT : {shift_name}", lines)
-                    self.assertTrue(any(line.startswith(first_row) for line in lines))
-                    self.assertTrue(any(line.startswith(last_row) for line in lines))
+                    self.assertTrue(any(line.startswith(f"| {first_row}") for line in lines))
+                    self.assertTrue(any(line.startswith(f"| {last_row}") for line in lines))
 
     def test_raw_email_body_keeps_the_existing_window_format(self):
         workflow = HourlyCsvWorkflow(cfg=_cfg(), selected_ids=["caster3"])
