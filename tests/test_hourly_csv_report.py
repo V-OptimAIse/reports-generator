@@ -7,7 +7,7 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import patch
 
-from cli.hourly_csv_report import HourlyCsvWorkflow, HourlyWindow
+from cli.hourly_csv_report import HourlyCasterResult, HourlyCsvWorkflow, HourlyWindow
 from reports.pipes.pipe_exporter import PipeExporter
 from reports.pipes.verified_pipes import VerifiedPipeExporter
 
@@ -43,6 +43,7 @@ def _cfg():
                 "outputs": {"csv_dir_template": "outputs/{caster_id}/csv"},
             },
             "items": [
+                {"id": "caster2", "number": 2, "var_dir": "unused/var/caster2"},
                 {"id": "caster3", "number": 3, "var_dir": "unused/var/caster3"},
             ],
         },
@@ -188,6 +189,96 @@ class HourlyExporterBoundaryTest(TestCase):
 
 
 class HourlyCsvWorkflowTest(TestCase):
+    def test_verified_email_uses_shift_table_with_enabled_casters_and_saved_counts(self):
+        with TemporaryDirectory() as tmp:
+            workflow = HourlyCsvWorkflow(cfg=_cfg())
+            workflow.state_dir = Path(tmp) / "state"
+            caster2, caster3 = workflow.casters
+
+            saved_counts = {
+                ("06:00", "07:00"): {"caster2": 0, "caster3": 12},
+                ("07:00", "08:00"): {"caster2": 12, "caster3": 14},
+            }
+            for (start, stop), counts in saved_counts.items():
+                saved_window = HourlyWindow.from_cli("08-08-2026", start, stop)
+                for caster in workflow.casters:
+                    state_path = workflow._state_path(saved_window, caster)
+                    state_path.parent.mkdir(parents=True, exist_ok=True)
+                    state_path.write_text(json.dumps({
+                        "verified_summary": {"verified_count": counts[caster.id]},
+                    }))
+
+            current_window = HourlyWindow.from_cli("08-08-2026", "08:00", "09:00")
+            current_results = [
+                HourlyCasterResult(caster=caster2, verified_summary={"verified_count": 16}),
+                HourlyCasterResult(caster=caster3, verified_summary={"verified_count": 16}),
+            ]
+            _, body = workflow._email_subject_and_body(
+                "verified",
+                current_window,
+                current_results,
+            )
+
+        self.assertEqual(
+            body,
+            "\n".join([
+                "Hourly Verified Pipe Production Report",
+                "",
+                "Date  : 08-08-2026",
+                "SHIFT : A",
+                "",
+                "Time Interval | Caster 2 | Caster 3",
+                "--------------+----------+---------",
+                "6--7          | 0        | 12      ",
+                "7--8          | 12       | 14      ",
+                "8--9          | 16       | 16      ",
+                "9--10         |          |         ",
+                "10--11        |          |         ",
+                "11--12        |          |         ",
+                "12--13        |          |         ",
+                "13--14        |          |         ",
+                "Total count   | 28       | 42      ",
+                "",
+                "2 CSV file(s) attached.",
+            ]),
+        )
+
+    def test_verified_email_builds_rows_for_all_three_configured_shifts(self):
+        cases = (
+            ("08-08-2026", "06:00", "07:00", "08-08-2026", "A", "6--7", "13--14"),
+            ("08-08-2026", "14:00", "15:00", "08-08-2026", "B", "14--15", "21--22"),
+            ("09-08-2026", "01:00", "02:00", "08-08-2026", "C", "22--23", "5--6"),
+        )
+        with TemporaryDirectory() as tmp:
+            workflow = HourlyCsvWorkflow(cfg=_cfg(), selected_ids=["caster3"])
+            workflow.state_dir = Path(tmp) / "state"
+            result = HourlyCasterResult(
+                caster=workflow.casters[0],
+                verified_summary={"verified_count": 5},
+            )
+
+            for date_str, start, stop, shift_date, shift_name, first_row, last_row in cases:
+                with self.subTest(shift=shift_name):
+                    window = HourlyWindow.from_cli(date_str, start, stop)
+                    _, body = workflow._email_subject_and_body("verified", window, [result])
+                    lines = body.splitlines()
+
+                    self.assertIn(f"Date  : {shift_date}", lines)
+                    self.assertIn(f"SHIFT : {shift_name}", lines)
+                    self.assertTrue(any(line.startswith(first_row) for line in lines))
+                    self.assertTrue(any(line.startswith(last_row) for line in lines))
+
+    def test_raw_email_body_keeps_the_existing_window_format(self):
+        workflow = HourlyCsvWorkflow(cfg=_cfg(), selected_ids=["caster3"])
+        window = HourlyWindow.from_cli("08-08-2026", "06:00", "07:00")
+        result = HourlyCasterResult(caster=workflow.casters[0], raw_count=4)
+
+        _, body = workflow._email_subject_and_body("raw", window, [result])
+
+        self.assertIn("Window : 06:00:00 to 07:00:00", body)
+        self.assertIn("Caster 3 : 4", body)
+        self.assertNotIn("SHIFT :", body)
+
     def test_sends_only_consolidated_raw_and_verified_csv_emails(self):
         events = []
         sent_messages = []

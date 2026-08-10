@@ -82,6 +82,30 @@ class HourlyWindow:
         return f"{self.start:%d-%m-%Y %H:%M:%S} to {self.stop:%d-%m-%Y %H:%M:%S}"
 
 
+@dataclass(frozen=True)
+class HourlyShift:
+    name: str
+    start: datetime
+    stop: datetime
+
+    @property
+    def display_name(self) -> str:
+        value = self.name.replace("_", " ").strip()
+        if value.lower().startswith("shift "):
+            value = value[6:].strip()
+        return value.upper()
+
+    @property
+    def windows(self) -> list[HourlyWindow]:
+        windows = []
+        start = self.start
+        while start < self.stop:
+            stop = min(start + timedelta(hours=1), self.stop)
+            windows.append(HourlyWindow(start=start, stop=stop))
+            start = stop
+        return windows
+
+
 @dataclass
 class HourlyCasterResult:
     caster: CasterConfig
@@ -310,6 +334,9 @@ class HourlyCsvWorkflow:
         if self.test_mode:
             subject = f"[TEST] {subject}"
 
+        if report_type == "verified":
+            return subject, self._verified_shift_table_body(window, results)
+
         lines = [
             f"Hourly {report_name} Production Report",
             "",
@@ -324,6 +351,116 @@ class HourlyCsvWorkflow:
             lines.append(f"{caster_label(result.caster, result.caster.cfg)} : {count}")
         lines.extend(["", f"{len(results)} CSV file(s) attached."])
         return subject, "\n".join(lines)
+
+    def _shift_for_window(self, window: HourlyWindow) -> HourlyShift:
+        configured = ((self.cfg.get("history", {}) or {}).get("shifts", []) or [])
+        if not configured:
+            raise ValueError("history.shifts is required for the hourly verified report table")
+
+        for item in configured:
+            if not isinstance(item, dict) or not all(key in item for key in ("name", "start", "end")):
+                raise ValueError("Each history.shifts item must define name, start, and end")
+
+            start_clock = HourlyWindow._parse_clock(str(item["start"]), "shift start")
+            stop_clock = HourlyWindow._parse_clock(str(item["end"]), "shift end")
+            for shift_date in (window.start.date(), window.start.date() - timedelta(days=1)):
+                shift_start = datetime.combine(shift_date, start_clock)
+                shift_stop = datetime.combine(shift_date, stop_clock)
+                if shift_stop <= shift_start:
+                    shift_stop += timedelta(days=1)
+                if shift_start <= window.start < shift_stop:
+                    return HourlyShift(
+                        name=str(item["name"]),
+                        start=shift_start,
+                        stop=shift_stop,
+                    )
+
+        raise ValueError(f"No configured shift contains hourly window {window.display}")
+
+    @staticmethod
+    def _interval_label(window: HourlyWindow) -> str:
+        def clock(value: datetime) -> str:
+            return str(value.hour) if value.minute == 0 else value.strftime("%H:%M")
+
+        return f"{clock(window.start)}--{clock(window.stop)}"
+
+    @staticmethod
+    def _format_text_table(headers: list[str], rows: list[list[str]]) -> list[str]:
+        widths = [
+            max(len(headers[index]), *(len(row[index]) for row in rows))
+            for index in range(len(headers))
+        ]
+
+        def format_row(row: list[str]) -> str:
+            return " | ".join(value.ljust(widths[index]) for index, value in enumerate(row))
+
+        return [
+            format_row(headers),
+            "-+-".join("-" * width for width in widths),
+            *(format_row(row) for row in rows),
+        ]
+
+    def _verified_count_for_window(
+        self,
+        row_window: HourlyWindow,
+        caster: CasterConfig,
+        current_window: HourlyWindow,
+        current_results: dict[str, HourlyCasterResult],
+    ) -> str:
+        summary = None
+        if row_window.start == current_window.start and row_window.stop == current_window.stop:
+            result = current_results.get(caster.id)
+            if result is not None:
+                summary = result.verified_summary or result.state.get("verified_summary")
+        if not isinstance(summary, dict):
+            summary = self._load_state(row_window, caster).get("verified_summary")
+        if not isinstance(summary, dict) or "verified_count" not in summary:
+            return ""
+        return str(summary["verified_count"])
+
+    def _verified_shift_table_body(
+        self,
+        window: HourlyWindow,
+        results: list[HourlyCasterResult],
+    ) -> str:
+        shift = self._shift_for_window(window)
+        current_results = {result.caster.id: result for result in results}
+        headers = ["Time Interval", *(caster_label(caster, caster.cfg) for caster in self.casters)]
+        rows = []
+        totals = [0] * len(self.casters)
+        has_counts = [False] * len(self.casters)
+        for row_window in shift.windows:
+            counts = [
+                self._verified_count_for_window(
+                    row_window,
+                    caster,
+                    window,
+                    current_results,
+                )
+                for caster in self.casters
+            ]
+            for index, count in enumerate(counts):
+                try:
+                    totals[index] += int(count)
+                    has_counts[index] = True
+                except (TypeError, ValueError):
+                    continue
+            rows.append([self._interval_label(row_window), *counts])
+        rows.append([
+            "Total count",
+            *(str(total) if has_counts[index] else "" for index, total in enumerate(totals)),
+        ])
+        lines = [
+            "Hourly Verified Pipe Production Report",
+            "",
+            f"Date  : {shift.start:%d-%m-%Y}",
+            f"SHIFT : {shift.display_name}",
+            "",
+            *self._format_text_table(headers, rows),
+            "",
+            f"{len(results)} CSV file(s) attached.",
+        ]
+        return "\n".join(lines)
 
     def _send_consolidated_email(
         self,
