@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import smtplib
 import sys
 import time
 import traceback
@@ -206,14 +207,26 @@ class HourlyCsvWorkflow:
         what: str,
         tries: int = 4,
         base_delay: float = 2.0,
+        should_retry: Callable[[Exception], bool] | None = None,
     ):
         last_error = None
+        attempts_made = 0
         for attempt in range(1, tries + 1):
+            attempts_made = attempt
             try:
                 return operation()
             except Exception as exc:
                 last_error = exc
                 if attempt == tries:
+                    break
+                if should_retry is not None and not should_retry(exc):
+                    logger.error(
+                        "%s failed with a non-retryable error; stopping after attempt %s/%s | error=%s",
+                        what,
+                        attempt,
+                        tries,
+                        exc,
+                    )
                     break
                 delay = base_delay * (2 ** (attempt - 1))
                 logger.warning(
@@ -225,7 +238,32 @@ class HourlyCsvWorkflow:
                     exc,
                 )
                 time.sleep(delay)
-        raise RuntimeError(f"{what} failed after {tries} tries: {last_error}") from last_error
+        raise RuntimeError(
+            f"{what} failed after {attempts_made} attempt(s): {last_error}"
+        ) from last_error
+
+    @staticmethod
+    def _should_retry_email_error(exc: Exception) -> bool:
+        if isinstance(
+            exc,
+            (
+                smtplib.SMTPAuthenticationError,
+                smtplib.SMTPNotSupportedError,
+                smtplib.SMTPRecipientsRefused,
+            ),
+        ):
+            return False
+        if isinstance(exc, smtplib.SMTPResponseException):
+            return 400 <= exc.smtp_code < 500
+        return isinstance(
+            exc,
+            (
+                TimeoutError,
+                ConnectionError,
+                OSError,
+                smtplib.SMTPException,
+            ),
+        )
 
     def _record_error(
         self,
@@ -571,6 +609,8 @@ class HourlyCsvWorkflow:
         report_type: str,
         window: HourlyWindow,
         results: list[HourlyCasterResult],
+        *,
+        mailer: EmailSender | None = None,
     ) -> bool:
         sent_key = f"{report_type}_email_sent"
         path_attribute = "raw_path" if report_type == "raw" else "verified_path"
@@ -609,7 +649,15 @@ class HourlyCsvWorkflow:
                 self._record_error(window, result, reason)
             return False
 
+        started = time.perf_counter()
         content = self._email_content(report_type, window, valid_results)
+        content_elapsed = time.perf_counter() - started
+        logger.info(
+            "Email timing | report=%s | content_build=%.3fs | html_body=%.3fs",
+            report_type,
+            content_elapsed,
+            content_elapsed if content.html_body is not None else 0.0,
+        )
         send_kwargs = {
             "attachments": attachments,
             "recipients": recipients,
@@ -617,14 +665,17 @@ class HourlyCsvWorkflow:
         if content.html_body is not None:
             send_kwargs["html_body"] = content.html_body
         try:
-            mailer = EmailSender(cfg=valid_results[0].caster.cfg)
+            active_mailer = mailer or EmailSender(cfg=valid_results[0].caster.cfg)
             self._retry(
-                lambda: mailer.send(
+                lambda: active_mailer.send(
                     content.subject,
                     content.text_body,
                     **send_kwargs,
                 ),
                 what=f"hourly {report_type} CSV email",
+                tries=3,
+                base_delay=1.0,
+                should_retry=self._should_retry_email_error,
             )
         except Exception:
             detail = traceback.format_exc()
@@ -670,6 +721,7 @@ class HourlyCsvWorkflow:
         self._save_state(window, result)
 
     def run(self, window: HourlyWindow) -> bool:
+        workflow_started = time.perf_counter()
         logger.info(
             "Hourly CSV workflow start | window=%s | casters=%s | email=%s | test=%s | force=%s",
             window.display,
@@ -679,6 +731,7 @@ class HourlyCsvWorkflow:
             self.force,
         )
         active_results = []
+        raw_started = time.perf_counter()
         for caster in self.casters:
             result = self._prepare_result(window, caster)
             if result is None:
@@ -694,10 +747,10 @@ class HourlyCsvWorkflow:
                     detail=traceback.format_exc(),
                 )
                 logger.exception("Hourly raw CSV export failed | caster=%s", caster.id)
+        raw_export_seconds = time.perf_counter() - raw_started
+        logger.info("PERFORMANCE | raw_export=%.3fs", raw_export_seconds)
 
-        if self.send_email:
-            self._send_consolidated_email("raw", window, active_results)
-
+        verified_started = time.perf_counter()
         for result in active_results:
             if not result.raw_path:
                 continue
@@ -711,9 +764,56 @@ class HourlyCsvWorkflow:
                     detail=traceback.format_exc(),
                 )
                 logger.exception("Hourly verified CSV export failed | caster=%s", result.caster.id)
+        verified_export_seconds = time.perf_counter() - verified_started
+        logger.info("PERFORMANCE | verified_export=%.3fs", verified_export_seconds)
 
-        if self.send_email:
-            self._send_consolidated_email("verified", window, active_results)
+        raw_email_seconds = 0.0
+        verified_email_seconds = 0.0
+        email_session_seconds = 0.0
+        if self.send_email and active_results:
+            email_session_started = time.perf_counter()
+            try:
+                mailer_started = time.perf_counter()
+                mailer = EmailSender(cfg=active_results[0].caster.cfg)
+                logger.info(
+                    "Email timing | workflow_mailer_initialization=%.3fs",
+                    time.perf_counter() - mailer_started,
+                )
+            except Exception:
+                detail = traceback.format_exc()
+                for report_type in ("raw", "verified"):
+                    for result in active_results:
+                        if not result.state.get(f"{report_type}_email_sent"):
+                            self._record_error(
+                                window,
+                                result,
+                                f"Hourly {report_type} email sender initialization failed",
+                                detail=detail,
+                            )
+                logger.exception("Hourly email sender initialization failed")
+            else:
+                with mailer:
+                    started = time.perf_counter()
+                    self._send_consolidated_email(
+                        "raw",
+                        window,
+                        active_results,
+                        mailer=mailer,
+                    )
+                    raw_email_seconds = time.perf_counter() - started
+                    logger.info("PERFORMANCE | raw_email=%.3fs", raw_email_seconds)
+
+                    started = time.perf_counter()
+                    self._send_consolidated_email(
+                        "verified",
+                        window,
+                        active_results,
+                        mailer=mailer,
+                    )
+                    verified_email_seconds = time.perf_counter() - started
+                    logger.info("PERFORMANCE | verified_email=%.3fs", verified_email_seconds)
+            email_session_seconds = time.perf_counter() - email_session_started
+            logger.info("PERFORMANCE | email_session=%.3fs", email_session_seconds)
 
         for result in active_results:
             self._finish_result(window, result)
@@ -724,6 +824,16 @@ class HourlyCsvWorkflow:
             window.display,
             [result.caster.id for result in active_results],
             success,
+        )
+        logger.info(
+            "PERFORMANCE | raw_export=%.3fs | verified_export=%.3fs | raw_email=%.3fs | "
+            "verified_email=%.3fs | email_session=%.3fs | total=%.3fs",
+            raw_export_seconds,
+            verified_export_seconds,
+            raw_email_seconds,
+            verified_email_seconds,
+            email_session_seconds,
+            time.perf_counter() - workflow_started,
         )
         return success
 

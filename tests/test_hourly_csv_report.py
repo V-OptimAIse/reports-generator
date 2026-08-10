@@ -1,4 +1,5 @@
 import json
+import smtplib
 import sqlite3
 from contextlib import closing
 from datetime import datetime
@@ -189,6 +190,18 @@ class HourlyExporterBoundaryTest(TestCase):
 
 
 class HourlyCsvWorkflowTest(TestCase):
+    def test_email_retry_classification_skips_permanent_smtp_errors(self):
+        self.assertFalse(HourlyCsvWorkflow._should_retry_email_error(
+            smtplib.SMTPAuthenticationError(535, b"invalid credentials")
+        ))
+        self.assertFalse(HourlyCsvWorkflow._should_retry_email_error(
+            smtplib.SMTPDataError(550, b"rejected")
+        ))
+        self.assertTrue(HourlyCsvWorkflow._should_retry_email_error(
+            smtplib.SMTPDataError(451, b"try again")
+        ))
+        self.assertTrue(HourlyCsvWorkflow._should_retry_email_error(TimeoutError()))
+
     def test_verified_email_uses_html_table_with_enabled_casters_and_saved_counts(self):
         with TemporaryDirectory() as tmp:
             workflow = HourlyCsvWorkflow(cfg=_cfg())
@@ -307,8 +320,16 @@ class HourlyCsvWorkflowTest(TestCase):
                     return path, {"verified_count": 1, "removed_count": 0}
 
             class FakeMailer:
+                instances = 0
+
                 def __init__(self, cfg=None):
-                    pass
+                    self.__class__.instances += 1
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc_value, traceback):
+                    return False
 
                 def send(
                     self,
@@ -318,6 +339,7 @@ class HourlyCsvWorkflowTest(TestCase):
                     recipients=None,
                     html_body=None,
                 ):
+                    events.append(("email", "verified" if html_body else "raw"))
                     sent_messages.append({
                         "subject": subject,
                         "body": body,
@@ -344,7 +366,11 @@ class HourlyCsvWorkflowTest(TestCase):
             state_path = workflow._state_path(window, workflow.casters[0])
             state = json.loads(state_path.read_text())
 
-        self.assertEqual([event[0] for event in events], ["raw", "verified"])
+        self.assertEqual(
+            [event[0] for event in events],
+            ["raw", "verified", "email", "email"],
+        )
+        self.assertEqual(FakeMailer.instances, 1)
         self.assertEqual(len(sent_messages), 2)
         self.assertIn("Hourly Raw Pipe", sent_messages[0]["subject"])
         self.assertEqual(sent_messages[0]["recipients"], ["raw@example.com"])

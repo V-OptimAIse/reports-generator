@@ -75,6 +75,8 @@ verified_pipe_records_recipients:
 
 email:
   smtp_server: smtp.gmail.com
+  # Maximum seconds allowed for each blocking SMTP socket operation.
+  smtp_timeout: 15
   send_csv_attachment: true   # true = attach CSV mail, false = skip attachment mail
   smtp_port: 587
   sender: innovate@v-optimai.com
@@ -194,4 +196,3 @@ casters:
       var_dir: ../electrosteel_pipe_detection_prod/var/caster_8
       rois:
         path: ../electrosteel_pipe_detection_prod/config/casters/caster_8/rois.yaml
-        
