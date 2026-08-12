@@ -32,7 +32,9 @@ gate2_closed_position_report:
   interval_minutes: 10
   recent_window_minutes: 10
   min_avg_coverage_percent: 70
+  # A detection is closed only when its centroid is in roi_name and not in open_roi_name.
   roi_name: roi_gate2_closed
+  open_roi_name: roi_gate2_open
   gate2_class_id: 3
   source_resolution:
     width: 1310

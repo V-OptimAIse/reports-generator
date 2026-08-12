@@ -19,6 +19,7 @@ class Gate2ClosedPositionReportTest(unittest.TestCase):
         report.cfg = {}
         report.report_cfg = {}
         report.roi_points = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]
+        report.open_roi_points = [(12.0, 12.0), (20.0, 12.0), (20.0, 20.0), (12.0, 20.0)]
         report.roi_area = 100.0
         report.gate2_class_id = 3
         return report
@@ -35,6 +36,16 @@ class Gate2ClosedPositionReportTest(unittest.TestCase):
 
         self.assertEqual(frame.gate2_detection_count, 1)
         self.assertEqual(frame.centroid_inside_count, 1)
+        self.assertEqual(frame.coverage_percent, 100.0)
+
+    def test_gate2_detection_in_both_closed_and_open_rois_is_not_counted_as_closed(self):
+        report = self._report()
+        report.open_roi_points = [(2.0, 2.0), (8.0, 2.0), (8.0, 8.0), (2.0, 8.0)]
+
+        frame = self._measure_yolo(report, "3 0.25 0.25 0.5 0.5\n")
+
+        self.assertEqual(frame.gate2_detection_count, 1)
+        self.assertEqual(frame.centroid_inside_count, 0)
         self.assertEqual(frame.coverage_percent, 100.0)
 
     def test_gate2_detection_half_inside_closed_roi_calculates_50_percent(self):
@@ -75,6 +86,7 @@ class Gate2ClosedPositionReportTest(unittest.TestCase):
             (581.0, 342.0),
             (30.0, 359.0),
         ]
+        report.open_roi_points = [(700.0, 400.0), (800.0, 400.0), (800.0, 500.0), (700.0, 500.0)]
         report.roi_area = Gate2ClosedPositionReport._polygon_area(report.roi_points)
         report.gate2_class_id = 3
         timestamp = datetime(2026, 6, 14, 17, 22, 41, 667000)
@@ -105,8 +117,15 @@ class Gate2ClosedPositionReportTest(unittest.TestCase):
                 (650.0, 735.0),
                 (22.0, 784.0),
             ],
+            "roi_gate2_open": [
+                (800.0, 500.0),
+                (1000.0, 500.0),
+                (1000.0, 700.0),
+                (800.0, 700.0),
+            ],
         }
         report.roi_name = "roi_gate2_closed"
+        report.open_roi_name = "roi_gate2_open"
         report.gate2_class_id = 3
         report.EPSILON = Gate2ClosedPositionReport.EPSILON
 
@@ -135,8 +154,15 @@ class Gate2ClosedPositionReportTest(unittest.TestCase):
                 (650.0, 735.0),
                 (22.0, 784.0),
             ],
+            "roi_gate2_open": [
+                (800.0, 500.0),
+                (1000.0, 500.0),
+                (1000.0, 700.0),
+                (800.0, 700.0),
+            ],
         }
         report.roi_name = "roi_gate2_closed"
+        report.open_roi_name = "roi_gate2_open"
         report.EPSILON = Gate2ClosedPositionReport.EPSILON
 
         with self.assertLogs("reports.gates.gate2_closed_position_report", level="WARNING"):
@@ -157,8 +183,15 @@ class Gate2ClosedPositionReportTest(unittest.TestCase):
                 (300.0, 400.0),
                 (100.0, 400.0),
             ],
+            "roi_gate2_open": [
+                (400.0, 200.0),
+                (500.0, 200.0),
+                (500.0, 400.0),
+                (400.0, 400.0),
+            ],
         }
         report.roi_name = "roi_gate2_closed"
+        report.open_roi_name = "roi_gate2_open"
         report.EPSILON = Gate2ClosedPositionReport.EPSILON
 
         with self.assertLogs("reports.gates.gate2_closed_position_report", level="WARNING"):
@@ -198,8 +231,15 @@ class Gate2ClosedPositionReportTest(unittest.TestCase):
                 (1204.0, 696.0),
                 (16.0, 734.0),
             ],
+            'roi_gate2_open': [
+                (1400.0, 500.0),
+                (1600.0, 500.0),
+                (1600.0, 700.0),
+                (1400.0, 700.0),
+            ],
         }
         report.roi_name = 'roi_gate2_closed'
+        report.open_roi_name = 'roi_gate2_open'
         report.roi_source_size = report._configured_roi_source_size()
 
         report._prepare_rois_for_source_size(frame_width=1310, frame_height=608)
@@ -261,6 +301,7 @@ class Gate2ClosedPositionReportTest(unittest.TestCase):
             "shift_c": ("22:00", "06:00"),
         }
         report.roi_name = "roi_gate2_closed"
+        report.open_roi_name = "roi_gate2_open"
         report.roi_source_size = (1310, 608)
         report.raw_rois = {
             "roi_gate2_closed": [
@@ -268,6 +309,12 @@ class Gate2ClosedPositionReportTest(unittest.TestCase):
                 (300.0, 100.0),
                 (300.0, 300.0),
                 (100.0, 300.0),
+            ],
+            "roi_gate2_open": [
+                (400.0, 100.0),
+                (600.0, 100.0),
+                (600.0, 300.0),
+                (400.0, 300.0),
             ],
         }
         report.roi_points = report.raw_rois["roi_gate2_closed"]

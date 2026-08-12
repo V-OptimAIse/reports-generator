@@ -86,7 +86,7 @@ class Gate2ClosedPositionReport:
     For each sampled YOLO text frame:
       1. keep only gate2 detections,
       2. calculate each detection centroid,
-      3. count centroids inside roi_gate2_closed as a diagnostic,
+      3. count centroids inside roi_gate2_closed and outside roi_gate2_open,
       4. calculate the percentage of detected Gate2 area inside roi_gate2_closed,
       5. use the best detection-inside-ROI percentage for that frame.
     """
@@ -94,6 +94,7 @@ class Gate2ClosedPositionReport:
     DEFAULT_INTERVAL_SECONDS = 10 * 60
     DEFAULT_THRESHOLD_PERCENT = 80.0
     DEFAULT_ROI_NAME = "roi_gate2_closed"
+    DEFAULT_OPEN_ROI_NAME = "roi_gate2_open"
     DEFAULT_GATE2_CLASS_ID = 3
     EPSILON = 1e-9
 
@@ -117,6 +118,7 @@ class Gate2ClosedPositionReport:
         self.threshold_percent = self._configured_threshold_percent()
         self.alert_on_no_samples = self._configured_alert_on_no_samples()
         self.roi_name = str(self.report_cfg.get("roi_name") or self.DEFAULT_ROI_NAME)
+        self.open_roi_name = str(self.report_cfg.get("open_roi_name") or self.DEFAULT_OPEN_ROI_NAME)
         self.roi_source_size = self._configured_roi_source_size()
         self.gate2_class_id = int(self.report_cfg.get("gate2_class_id", self.DEFAULT_GATE2_CLASS_ID))
 
@@ -129,14 +131,19 @@ class Gate2ClosedPositionReport:
         self.raw_rois = self._load_rois(self._resolve_roi_path())
         if self.roi_name not in self.raw_rois:
             raise ValueError(f"ROI {self.roi_name!r} not found")
+        if self.open_roi_name not in self.raw_rois:
+            raise ValueError(f"ROI {self.open_roi_name!r} not found")
 
         self.rois = self.raw_rois
         self.roi_scale_x = 1.0
         self.roi_scale_y = 1.0
         self.roi_points = self.raw_rois[self.roi_name]
+        self.open_roi_points = self.raw_rois[self.open_roi_name]
         self.roi_area = self._polygon_area(self.roi_points)
         if self.roi_area <= 0:
             raise ValueError(f"{self.roi_name} has zero area")
+        if self._polygon_area(self.open_roi_points) <= 0:
+            raise ValueError(f"{self.open_roi_name} has zero area")
 
         shifts_cfg = history_cfg.get("shifts", [])
         if not shifts_cfg:
@@ -505,7 +512,7 @@ class Gate2ClosedPositionReport:
 
     def _prepare_rois_for_source_size(self, frame_width: int, frame_height: int):
         roi_source_width, roi_source_height = self._resolve_roi_source_size(
-            self.raw_rois[self.roi_name],
+            self.raw_rois[self.roi_name] + self.raw_rois[self.open_roi_name],
             frame_width,
             frame_height,
         )
@@ -516,9 +523,12 @@ class Gate2ClosedPositionReport:
             for name, points in self.raw_rois.items()
         }
         self.roi_points = self.rois[self.roi_name]
+        self.open_roi_points = self.rois[self.open_roi_name]
         self.roi_area = self._polygon_area(self.roi_points)
         if self.roi_area <= 0:
             raise ValueError(f"{self.roi_name} has zero area after ROI scaling")
+        if self._polygon_area(self.open_roi_points) <= 0:
+            raise ValueError(f"{self.open_roi_name} has zero area after ROI scaling")
 
         if abs(self.roi_scale_x - 1.0) > self.EPSILON or abs(self.roi_scale_y - 1.0) > self.EPSILON:
             logger.info(
@@ -679,6 +689,12 @@ class Gate2ClosedPositionReport:
         xs, ys = zip(*centroids)
         return min(xs), max(xs), min(ys), max(ys)
 
+    def _is_gate2_closed_centroid(self, centroid: Point) -> bool:
+        return (
+            self._point_in_polygon(centroid, self.roi_points)
+            and not self._point_in_polygon(centroid, self.open_roi_points)
+        )
+
     def _measure_frame(self, timestamp: datetime, text_path: Path, frame_width: int, frame_height: int) -> FrameCoverage:
         best_coverage = 0.0
         gate2_count = 0
@@ -706,7 +722,7 @@ class Gate2ClosedPositionReport:
 
                 centroid = self._yolo_centroid(xc, yc, frame_width, frame_height)
                 centroids.append(centroid)
-                if self._point_in_polygon(centroid, self.roi_points):
+                if self._is_gate2_closed_centroid(centroid):
                     centroid_inside_count += 1
 
                 intersection = self._convex_intersection(polygon, self.roi_points)

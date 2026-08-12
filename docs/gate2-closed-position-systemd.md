@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This job checks the most recent 10 minutes of Gate 2 closed-position detections for every enabled caster. It compares the detected Gate 2 area with each caster's configured `roi_gate2_closed` ROI.
+This job checks the most recent 10 minutes of Gate 2 closed-position detections for every enabled caster. A Gate 2 detection is counted as closed only when its centroid is inside `roi_gate2_closed` and outside `roi_gate2_open`. It also compares the detected Gate 2 area with the configured closed ROI.
 
 An alert email is sent when a caster's average detection-inside-ROI percentage is below `gate2_closed_position_report.min_avg_coverage_percent` in `config/runtime.yaml`. The current threshold is 80%. With `alert_on_no_samples: false`, an interval containing no YOLO samples does not send an alert.
 

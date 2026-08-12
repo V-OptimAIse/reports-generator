@@ -279,6 +279,11 @@ class MultiCasterConfigTest(TestCase):
                     "- [10, 0]",
                     "- [10, 10]",
                     "- [0, 10]",
+                    "roi_gate2_open:",
+                    "- [20, 0]",
+                    "- [30, 0]",
+                    "- [30, 10]",
+                    "- [20, 10]",
                 ]),
                 encoding="utf-8",
             )
@@ -302,6 +307,7 @@ class MultiCasterConfigTest(TestCase):
 
         self.assertEqual(report.history_root, history)
         self.assertEqual(report.roi_points, [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)])
+        self.assertEqual(report.open_roi_points, [(20.0, 0.0), (30.0, 0.0), (30.0, 10.0), (20.0, 10.0)])
 
     def test_gate_cycles_exporter_has_no_hardcoded_db_path(self):
         self.assertFalse(hasattr(gate_cycles_exporter, "DB_PATH"))
