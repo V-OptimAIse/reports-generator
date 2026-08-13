@@ -56,7 +56,7 @@ jetson_storage_alert:
   recipient_mode: test
 
 video_retention:
-  keep_days: 5
+  keep_days: 7
   include_overlay_videos: true
 
 workflow:
@@ -73,6 +73,7 @@ verified_pipe_records_recipients:
   - swsdp@electrosteel.com
   - info@v-optimai.com
   - srinukotaru@electrosteel.com
+  - mohan.m@electrosteel.com
 
 
 email:
