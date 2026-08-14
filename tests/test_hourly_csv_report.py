@@ -292,6 +292,76 @@ class HourlyCsvWorkflowTest(TestCase):
         self.assertIn("Caster 3 : 4", body)
         self.assertNotIn("SHIFT :", body)
 
+    def test_verified_csv_accumulates_completed_hours_in_the_same_shift(self):
+        with TemporaryDirectory() as tmp:
+            output_root = Path(tmp)
+
+            class FakePipeExporter:
+                def __init__(self, cfg=None, caster=None):
+                    self.caster = caster
+
+                def export_window(self, start, stop):
+                    path = output_root / f"raw_{start:%H%M}.csv"
+                    path.write_text("pipe_uid,t_origin\n", encoding="utf-8")
+                    return path, 1
+
+            class FakeVerifiedExporter:
+                CLIENT_COLUMNS = VerifiedPipeExporter.CLIENT_COLUMNS
+
+                def __init__(self, cfg=None, caster=None):
+                    self.caster = caster
+
+                def export_window(self, start, stop, raw_path, *, mode=None):
+                    path = output_root / f"verified_{start:%H%M}.csv"
+                    path.write_text(
+                        f"Pipe Number,Origin Time\n1,{start:%Y-%m-%d %H}:10:00\n",
+                        encoding="utf-8",
+                    )
+                    return path, {"verified_count": 1, "removed_count": 0}
+
+            workflow = HourlyCsvWorkflow(
+                cfg=_cfg(),
+                selected_ids=["caster3"],
+                send_email=False,
+            )
+            workflow.state_dir = output_root / "state"
+            first_window = HourlyWindow.from_cli("08-08-2026", "02:00", "03:00")
+            second_window = HourlyWindow.from_cli("08-08-2026", "03:00", "04:00")
+            next_shift_window = HourlyWindow.from_cli("08-08-2026", "06:00", "07:00")
+
+            with (
+                patch("cli.hourly_csv_report.PipeExporter", FakePipeExporter),
+                patch("cli.hourly_csv_report.VerifiedPipeExporter", FakeVerifiedExporter),
+            ):
+                self.assertTrue(workflow.run(first_window))
+                self.assertTrue(workflow.run(second_window))
+                self.assertTrue(workflow.run(next_shift_window))
+
+            caster = workflow.casters[0]
+            first_state = json.loads(workflow._state_path(first_window, caster).read_text())
+            second_state = json.loads(workflow._state_path(second_window, caster).read_text())
+            next_shift_state = json.loads(
+                workflow._state_path(next_shift_window, caster).read_text()
+            )
+            first_rows = Path(first_state["verified_csv_path"]).read_text(encoding="utf-8")
+            second_rows = Path(second_state["verified_csv_path"]).read_text(encoding="utf-8")
+            next_shift_rows = Path(next_shift_state["verified_csv_path"]).read_text(
+                encoding="utf-8"
+            )
+
+        self.assertIn("2026-08-08 02:10:00", first_rows)
+        self.assertNotIn("2026-08-08 03:10:00", first_rows)
+        self.assertIn("1,2026-08-08 02:10:00", second_rows)
+        self.assertIn("2,2026-08-08 03:10:00", second_rows)
+        self.assertNotIn("2026-08-08 03:10:00", next_shift_rows)
+        self.assertIn("1,2026-08-08 06:10:00", next_shift_rows)
+        self.assertEqual(second_state["verified_summary"]["verified_count"], 1)
+        self.assertEqual(second_state["verified_cumulative_count"], 2)
+        self.assertNotEqual(
+            second_state["verified_hour_csv_path"],
+            second_state["verified_cumulative_csv_path"],
+        )
+
     def test_sends_only_consolidated_raw_and_verified_csv_emails(self):
         events = []
         sent_messages = []

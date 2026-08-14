@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
 import smtplib
@@ -128,6 +129,8 @@ class HourlyEmailContent:
 
 class HourlyCsvWorkflow:
     """Generate and email only raw and verified CSVs for a custom time window."""
+
+    VERIFIED_CSV_COLUMNS = ("Pipe Number", "Origin Time")
 
     def __init__(
         self,
@@ -330,7 +333,10 @@ class HourlyCsvWorkflow:
         self._save_state(window, result)
 
     def _export_verified(self, window: HourlyWindow, result: HourlyCasterResult):
-        previous_path = result.state.get("verified_csv_path")
+        previous_path = (
+            result.state.get("verified_cumulative_csv_path")
+            or result.state.get("verified_csv_path")
+        )
         previous_summary = result.state.get("verified_summary")
         if (
             not self.force
@@ -350,7 +356,7 @@ class HourlyCsvWorkflow:
         if not result.raw_path:
             raise RuntimeError("Raw CSV is unavailable")
         exporter = VerifiedPipeExporter(cfg=result.caster.cfg, caster=result.caster)
-        path, summary = self._retry(
+        hourly_path, summary = self._retry(
             lambda: exporter.export_window(
                 window.start,
                 window.stop,
@@ -359,12 +365,130 @@ class HourlyCsvWorkflow:
             ),
             what=f"{result.caster.id} hourly verified CSV export",
         )
-        result.verified_path = str(path)
+        cumulative_path, cumulative_count = self._build_cumulative_verified_csv(
+            window,
+            result.caster,
+            Path(hourly_path),
+        )
+        result.verified_path = str(cumulative_path)
         result.verified_summary = summary
+        result.state["verified_hour_csv_path"] = str(hourly_path)
         result.state["verified_csv_path"] = result.verified_path
+        result.state["verified_cumulative_csv_path"] = result.verified_path
+        result.state["verified_cumulative_count"] = cumulative_count
         result.state["verified_summary"] = summary
         result.state["verified_exported"] = True
         self._save_state(window, result)
+
+    def _prior_verified_csv_paths(
+        self,
+        window: HourlyWindow,
+        caster: CasterConfig,
+    ) -> list[Path]:
+        """Return the smallest saved CSV set covering earlier hours in this shift."""
+        shift = self._shift_for_window(window)
+        paths: list[Path] = []
+        for row_window in shift.windows:
+            if row_window.stop > window.start:
+                break
+
+            state = self._load_state(row_window, caster)
+            cumulative_value = state.get("verified_cumulative_csv_path")
+            hourly_value = state.get("verified_hour_csv_path")
+            legacy_value = state.get("verified_csv_path")
+            value = cumulative_value or hourly_value or legacy_value
+            expected_count = state.get("verified_cumulative_count")
+            if expected_count is None:
+                summary = state.get("verified_summary")
+                if isinstance(summary, dict):
+                    expected_count = summary.get("verified_count")
+            try:
+                expected_count = int(expected_count)
+            except (TypeError, ValueError):
+                expected_count = None
+
+            if not value:
+                if expected_count and expected_count > 0:
+                    raise FileNotFoundError(
+                        f"Saved verified CSV path is missing for {caster.id} "
+                        f"window {row_window.display}"
+                    )
+                continue
+
+            path = Path(value)
+            if not path.exists():
+                if expected_count == 0:
+                    continue
+                raise FileNotFoundError(
+                    f"Saved verified CSV is missing for {caster.id} "
+                    f"window {row_window.display}: {path}"
+                )
+
+            if cumulative_value:
+                # This file already contains every earlier completed hour, so it
+                # supersedes individual files collected before it.
+                paths = [path]
+            else:
+                paths.append(path)
+        return paths
+
+    @staticmethod
+    def _verified_origin_times(path: Path) -> list[str]:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            missing = [
+                column
+                for column in HourlyCsvWorkflow.VERIFIED_CSV_COLUMNS
+                if column not in (reader.fieldnames or [])
+            ]
+            if missing:
+                raise ValueError(
+                    f"Verified CSV {path} is missing columns: {', '.join(missing)}"
+                )
+            return [str(row.get("Origin Time") or "") for row in reader]
+
+    def _build_cumulative_verified_csv(
+        self,
+        window: HourlyWindow,
+        caster: CasterConfig,
+        hourly_path: Path,
+    ) -> tuple[Path, int]:
+        prior_paths = self._prior_verified_csv_paths(window, caster)
+        if not prior_paths:
+            return hourly_path, len(self._verified_origin_times(hourly_path))
+
+        origin_times: list[str] = []
+        for path in [*prior_paths, hourly_path]:
+            origin_times.extend(self._verified_origin_times(path))
+
+        cumulative_path = hourly_path.with_name(
+            f"{hourly_path.stem}_cumulative{hourly_path.suffix}"
+        )
+        with cumulative_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=list(self.VERIFIED_CSV_COLUMNS),
+            )
+            writer.writeheader()
+            writer.writerows(
+                {
+                    "Pipe Number": pipe_number,
+                    "Origin Time": origin_time,
+                }
+                for pipe_number, origin_time in enumerate(origin_times, start=1)
+            )
+
+        logger.info(
+            "Cumulative verified CSV built | caster=%s | shift_start=%s | through=%s | "
+            "source_files=%s | verified_count=%s | path=%s",
+            caster.id,
+            self._shift_for_window(window).start,
+            window.stop,
+            len(prior_paths) + 1,
+            len(origin_times),
+            cumulative_path,
+        )
+        return cumulative_path, len(origin_times)
 
     def _email_content(
         self,
