@@ -77,10 +77,11 @@ uv run python -m cli.hourly_csv_report --date 08-08-2026 --start 01:00 --stop 02
 
 Hourly windows are half-open: `01:00 <= event time < 02:00`. This prevents the
 02:00 record from appearing in both the 01:00-02:00 and 02:00-03:00 reports.
-The verified email table and verified CSV attachment accumulate completed hours
-within the current shift. For example, the 03:00-04:00 verified email includes
-both the 02:00-03:00 and 03:00-04:00 verified data. Only the new hour is queried
-and verified; saved verified CSV data is reused for earlier hours.
+The raw and verified CSV attachments accumulate completed hours within the current
+shift, and the verified email table does the same for its hourly counts. For
+example, the 03:00-04:00 email attachments include both the 02:00-03:00 and
+03:00-04:00 data. Only the new hour is queried and verified; saved CSV data is
+reused for earlier hours.
 Successful windows are recorded under `outputs/state/hourly`, so a repeated systemd
 activation does not resend the same report. Use `--force` only when an intentional
 resend is required.

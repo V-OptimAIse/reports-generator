@@ -115,6 +115,7 @@ class HourlyCasterResult:
     state: dict = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
     raw_path: str | None = None
+    raw_hour_path: str | None = None
     raw_count: int | str = 0
     verified_path: str | None = None
     verified_summary: dict | None = None
@@ -313,22 +314,42 @@ class HourlyCsvWorkflow:
         return result
 
     def _export_raw(self, window: HourlyWindow, result: HourlyCasterResult):
-        previous_path = result.state.get("raw_csv_path")
-        if not self.force and previous_path and Path(previous_path).exists():
+        previous_path = (
+            result.state.get("raw_cumulative_csv_path")
+            or result.state.get("raw_csv_path")
+        )
+        previous_hour_path = result.state.get("raw_hour_csv_path") or previous_path
+        if (
+            not self.force
+            and previous_path
+            and previous_hour_path
+            and Path(previous_path).exists()
+            and Path(previous_hour_path).exists()
+        ):
             result.raw_path = str(previous_path)
+            result.raw_hour_path = str(previous_hour_path)
             result.raw_count = result.state.get("raw_count", 0)
             logger.info("Reusing hourly raw CSV | caster=%s | path=%s", result.caster.id, previous_path)
             return
 
         exporter = PipeExporter(cfg=result.caster.cfg, caster=result.caster)
-        path, count = self._retry(
+        hourly_path, count = self._retry(
             lambda: exporter.export_window(window.start, window.stop),
             what=f"{result.caster.id} hourly raw CSV export",
         )
-        result.raw_path = str(path)
+        cumulative_path, cumulative_count = self._build_cumulative_raw_csv(
+            window,
+            result.caster,
+            Path(hourly_path),
+        )
+        result.raw_path = str(cumulative_path)
+        result.raw_hour_path = str(hourly_path)
         result.raw_count = int(count)
+        result.state["raw_hour_csv_path"] = str(hourly_path)
         result.state["raw_csv_path"] = result.raw_path
         result.state["raw_count"] = result.raw_count
+        result.state["raw_cumulative_csv_path"] = result.raw_path
+        result.state["raw_cumulative_count"] = cumulative_count
         result.state["raw_exported"] = True
         self._save_state(window, result)
 
@@ -353,14 +374,14 @@ class HourlyCsvWorkflow:
             )
             return
 
-        if not result.raw_path:
-            raise RuntimeError("Raw CSV is unavailable")
+        if not result.raw_hour_path:
+            raise RuntimeError("Current-hour raw CSV is unavailable")
         exporter = VerifiedPipeExporter(cfg=result.caster.cfg, caster=result.caster)
         hourly_path, summary = self._retry(
             lambda: exporter.export_window(
                 window.start,
                 window.stop,
-                result.raw_path,
+                result.raw_hour_path,
                 mode=self._verified_mode(result.caster.cfg),
             ),
             what=f"{result.caster.id} hourly verified CSV export",
@@ -380,12 +401,16 @@ class HourlyCsvWorkflow:
         result.state["verified_exported"] = True
         self._save_state(window, result)
 
-    def _prior_verified_csv_paths(
+    def _prior_csv_paths(
         self,
         window: HourlyWindow,
         caster: CasterConfig,
+        report_type: str,
     ) -> list[Path]:
         """Return the smallest saved CSV set covering earlier hours in this shift."""
+        if report_type not in {"raw", "verified"}:
+            raise ValueError(f"Unsupported hourly report type: {report_type}")
+
         shift = self._shift_for_window(window)
         paths: list[Path] = []
         for row_window in shift.windows:
@@ -393,15 +418,18 @@ class HourlyCsvWorkflow:
                 break
 
             state = self._load_state(row_window, caster)
-            cumulative_value = state.get("verified_cumulative_csv_path")
-            hourly_value = state.get("verified_hour_csv_path")
-            legacy_value = state.get("verified_csv_path")
+            cumulative_value = state.get(f"{report_type}_cumulative_csv_path")
+            hourly_value = state.get(f"{report_type}_hour_csv_path")
+            legacy_value = state.get(f"{report_type}_csv_path")
             value = cumulative_value or hourly_value or legacy_value
-            expected_count = state.get("verified_cumulative_count")
+            expected_count = state.get(f"{report_type}_cumulative_count")
             if expected_count is None:
-                summary = state.get("verified_summary")
-                if isinstance(summary, dict):
-                    expected_count = summary.get("verified_count")
+                if report_type == "raw":
+                    expected_count = state.get("raw_count")
+                else:
+                    summary = state.get("verified_summary")
+                    if isinstance(summary, dict):
+                        expected_count = summary.get("verified_count")
             try:
                 expected_count = int(expected_count)
             except (TypeError, ValueError):
@@ -410,7 +438,7 @@ class HourlyCsvWorkflow:
             if not value:
                 if expected_count and expected_count > 0:
                     raise FileNotFoundError(
-                        f"Saved verified CSV path is missing for {caster.id} "
+                        f"Saved {report_type} CSV path is missing for {caster.id} "
                         f"window {row_window.display}"
                     )
                 continue
@@ -420,7 +448,7 @@ class HourlyCsvWorkflow:
                 if expected_count == 0:
                     continue
                 raise FileNotFoundError(
-                    f"Saved verified CSV is missing for {caster.id} "
+                    f"Saved {report_type} CSV is missing for {caster.id} "
                     f"window {row_window.display}: {path}"
                 )
 
@@ -431,6 +459,62 @@ class HourlyCsvWorkflow:
             else:
                 paths.append(path)
         return paths
+
+    @staticmethod
+    def _csv_rows(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if not reader.fieldnames:
+                raise ValueError(f"CSV has no header: {path}")
+            return list(reader.fieldnames), list(reader)
+
+    def _build_cumulative_raw_csv(
+        self,
+        window: HourlyWindow,
+        caster: CasterConfig,
+        hourly_path: Path,
+    ) -> tuple[Path, int]:
+        prior_paths = self._prior_csv_paths(window, caster, "raw")
+        current_columns, current_rows = self._csv_rows(hourly_path)
+        if not prior_paths:
+            return hourly_path, len(current_rows)
+
+        rows: list[dict[str, str]] = []
+        expected_columns: list[str] | None = None
+        for path in prior_paths:
+            columns, source_rows = self._csv_rows(path)
+            if expected_columns is None:
+                expected_columns = columns
+            elif columns != expected_columns:
+                raise ValueError(
+                    f"Raw CSV columns do not match while accumulating {path}"
+                )
+            rows.extend(source_rows)
+        if current_columns != expected_columns:
+            raise ValueError(
+                f"Raw CSV columns do not match while accumulating {hourly_path}"
+            )
+        rows.extend(current_rows)
+
+        cumulative_path = hourly_path.with_name(
+            f"{hourly_path.stem}_cumulative{hourly_path.suffix}"
+        )
+        with cumulative_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=expected_columns or current_columns)
+            writer.writeheader()
+            writer.writerows(rows)
+
+        logger.info(
+            "Cumulative raw CSV built | caster=%s | shift_start=%s | through=%s | "
+            "source_files=%s | raw_count=%s | path=%s",
+            caster.id,
+            self._shift_for_window(window).start,
+            window.stop,
+            len(prior_paths) + 1,
+            len(rows),
+            cumulative_path,
+        )
+        return cumulative_path, len(rows)
 
     @staticmethod
     def _verified_origin_times(path: Path) -> list[str]:
@@ -453,7 +537,7 @@ class HourlyCsvWorkflow:
         caster: CasterConfig,
         hourly_path: Path,
     ) -> tuple[Path, int]:
-        prior_paths = self._prior_verified_csv_paths(window, caster)
+        prior_paths = self._prior_csv_paths(window, caster, "verified")
         if not prior_paths:
             return hourly_path, len(self._verified_origin_times(hourly_path))
 

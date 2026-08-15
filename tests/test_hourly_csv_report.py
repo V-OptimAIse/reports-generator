@@ -292,9 +292,10 @@ class HourlyCsvWorkflowTest(TestCase):
         self.assertIn("Caster 3 : 4", body)
         self.assertNotIn("SHIFT :", body)
 
-    def test_verified_csv_accumulates_completed_hours_in_the_same_shift(self):
+    def test_raw_and_verified_csvs_accumulate_completed_hours_in_the_same_shift(self):
         with TemporaryDirectory() as tmp:
             output_root = Path(tmp)
+            verified_inputs = []
 
             class FakePipeExporter:
                 def __init__(self, cfg=None, caster=None):
@@ -302,7 +303,10 @@ class HourlyCsvWorkflowTest(TestCase):
 
                 def export_window(self, start, stop):
                     path = output_root / f"raw_{start:%H%M}.csv"
-                    path.write_text("pipe_uid,t_origin\n", encoding="utf-8")
+                    path.write_text(
+                        f"pipe_uid,t_origin\np{start:%H%M},{start:%Y-%m-%d %H}:10:00\n",
+                        encoding="utf-8",
+                    )
                     return path, 1
 
             class FakeVerifiedExporter:
@@ -312,6 +316,7 @@ class HourlyCsvWorkflowTest(TestCase):
                     self.caster = caster
 
                 def export_window(self, start, stop, raw_path, *, mode=None):
+                    verified_inputs.append(Path(raw_path).name)
                     path = output_root / f"verified_{start:%H%M}.csv"
                     path.write_text(
                         f"Pipe Number,Origin Time\n1,{start:%Y-%m-%d %H}:10:00\n",
@@ -348,6 +353,11 @@ class HourlyCsvWorkflowTest(TestCase):
             next_shift_rows = Path(next_shift_state["verified_csv_path"]).read_text(
                 encoding="utf-8"
             )
+            first_raw_rows = Path(first_state["raw_csv_path"]).read_text(encoding="utf-8")
+            second_raw_rows = Path(second_state["raw_csv_path"]).read_text(encoding="utf-8")
+            next_shift_raw_rows = Path(next_shift_state["raw_csv_path"]).read_text(
+                encoding="utf-8"
+            )
 
         self.assertIn("2026-08-08 02:10:00", first_rows)
         self.assertNotIn("2026-08-08 03:10:00", first_rows)
@@ -360,6 +370,22 @@ class HourlyCsvWorkflowTest(TestCase):
         self.assertNotEqual(
             second_state["verified_hour_csv_path"],
             second_state["verified_cumulative_csv_path"],
+        )
+        self.assertIn("p0200,2026-08-08 02:10:00", first_raw_rows)
+        self.assertNotIn("p0300", first_raw_rows)
+        self.assertIn("p0200,2026-08-08 02:10:00", second_raw_rows)
+        self.assertIn("p0300,2026-08-08 03:10:00", second_raw_rows)
+        self.assertNotIn("p0300", next_shift_raw_rows)
+        self.assertIn("p0600,2026-08-08 06:10:00", next_shift_raw_rows)
+        self.assertEqual(second_state["raw_count"], 1)
+        self.assertEqual(second_state["raw_cumulative_count"], 2)
+        self.assertNotEqual(
+            second_state["raw_hour_csv_path"],
+            second_state["raw_cumulative_csv_path"],
+        )
+        self.assertEqual(
+            verified_inputs,
+            ["raw_0200.csv", "raw_0300.csv", "raw_0600.csv"],
         )
 
     def test_sends_only_consolidated_raw_and_verified_csv_emails(self):

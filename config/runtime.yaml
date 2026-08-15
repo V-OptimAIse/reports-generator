@@ -63,6 +63,17 @@ workflow:
   # Keep each systemd-triggered shift job under the 8-hour timer interval.
   max_runtime_seconds: 25200
   video_upload_workers: 2
+
+# Hourly raw and verified CSV emails go only to these test recipients.
+# These overrides do not change the shift-report recipient lists below.
+hourly_csv_report:
+  raw_recipients:
+    - karikutisasikumar1301@gmail.com
+    - punithsai2001@gmail.com
+  verified_recipients:
+    - karikutisasikumar1301@gmail.com
+    - punithsai2001@gmail.com
+
 verified_pipe_records_recipients:
   - punithsai2001@gmail.com
   - saikiran@electrosteel.com
