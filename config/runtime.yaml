@@ -67,6 +67,7 @@ workflow:
 # Hourly raw and verified CSV emails go only to these test recipients.
 # These overrides do not change the shift-report recipient lists below.
 hourly_csv_report:
+  image_dir: outputs/hourly-report-images
   raw_recipients:
     - karikutisasikumar1301@gmail.com
     - punithsai2001@gmail.com

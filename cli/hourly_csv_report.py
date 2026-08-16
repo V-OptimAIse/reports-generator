@@ -22,6 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from reports.common.caster_config import CasterConfig, caster_label, resolve_enabled_casters
 from reports.common.config_loader import load_runtime_config
 from reports.common.email_sender import EmailSender
+from reports.common.table_image import save_table_image
 from reports.pipes.pipe_exporter import PipeExporter
 from reports.pipes.verified_pipes import VerifiedPipeExporter
 
@@ -122,10 +123,19 @@ class HourlyCasterResult:
 
 
 @dataclass(frozen=True)
+class HourlyVerifiedTable:
+    shift: HourlyShift
+    caster_labels: tuple[str, ...]
+    rows: tuple[tuple[str, tuple[str, ...]], ...]
+    total_values: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class HourlyEmailContent:
     subject: str
     text_body: str
     html_body: str | None = None
+    verified_table: HourlyVerifiedTable | None = None
 
 
 class HourlyCsvWorkflow:
@@ -579,6 +589,8 @@ class HourlyCsvWorkflow:
         report_type: str,
         window: HourlyWindow,
         results: list[HourlyCasterResult],
+        *,
+        verified_table: HourlyVerifiedTable | None = None,
     ) -> HourlyEmailContent:
         report_name = "Raw Pipe" if report_type == "raw" else "Verified Pipe"
         subject = (
@@ -589,11 +601,17 @@ class HourlyCsvWorkflow:
             subject = f"[TEST] {subject}"
 
         if report_type == "verified":
-            text_body, html_body = self._verified_shift_email_bodies(window, results)
+            table = verified_table or self._verified_shift_table(window, results)
+            text_body, html_body = self._verified_shift_email_bodies(
+                window,
+                results,
+                table=table,
+            )
             return HourlyEmailContent(
                 subject=subject,
                 text_body=text_body,
                 html_body=html_body,
+                verified_table=table,
             )
 
         lines = [
@@ -665,11 +683,11 @@ class HourlyCsvWorkflow:
             return ""
         return str(summary["verified_count"])
 
-    def _verified_shift_email_bodies(
+    def _verified_shift_table(
         self,
         window: HourlyWindow,
         results: list[HourlyCasterResult],
-    ) -> tuple[str, str]:
+    ) -> HourlyVerifiedTable:
         shift = self._shift_for_window(window)
         current_results = {result.caster.id: result for result in results}
         caster_labels = [caster_label(caster, caster.cfg) for caster in self.casters]
@@ -697,6 +715,26 @@ class HourlyCsvWorkflow:
             str(total) if has_counts[index] else ""
             for index, total in enumerate(totals)
         ]
+
+        return HourlyVerifiedTable(
+            shift=shift,
+            caster_labels=tuple(caster_labels),
+            rows=tuple((interval, tuple(counts)) for interval, counts in rows),
+            total_values=tuple(total_values),
+        )
+
+    def _verified_shift_email_bodies(
+        self,
+        window: HourlyWindow,
+        results: list[HourlyCasterResult],
+        *,
+        table: HourlyVerifiedTable | None = None,
+    ) -> tuple[str, str]:
+        table = table or self._verified_shift_table(window, results)
+        shift = table.shift
+        caster_labels = table.caster_labels
+        rows = table.rows
+        total_values = table.total_values
         attachment_count = len(results)
         attachment_text = (
             f"{attachment_count} CSV "
@@ -812,6 +850,64 @@ class HourlyCsvWorkflow:
         )
         return "\n".join(text_lines), html_body
 
+    def _verified_table_image_path(
+        self,
+        window: HourlyWindow,
+        results: list[HourlyCasterResult],
+    ) -> Path:
+        hourly_cfg = self.cfg.get("hourly_csv_report", {}) or {}
+        image_dir = Path(str(hourly_cfg.get("image_dir") or "outputs/hourly-report-images"))
+        if not image_dir.is_absolute():
+            image_dir = self.root / image_dir
+
+        caster_token = "_".join(result.caster.id for result in results)
+        caster_token = "".join(
+            character if character.isalnum() or character in {"-", "_"} else "_"
+            for character in caster_token
+        )
+        return image_dir / (
+            f"verified_hourly_report_{window.state_token}_{caster_token}.png"
+        )
+
+    def _save_verified_table_image(
+        self,
+        window: HourlyWindow,
+        results: list[HourlyCasterResult],
+        *,
+        table: HourlyVerifiedTable | None = None,
+    ) -> Path:
+        if not results:
+            raise ValueError("At least one verified result is required for the table image")
+
+        table = table or self._verified_shift_table(window, results)
+        output_path = self._verified_table_image_path(window, results)
+        rows = [
+            (interval, *counts)
+            for interval, counts in table.rows
+        ]
+        rows.append(("Total Count", *table.total_values))
+        saved_path = save_table_image(
+            output_path,
+            title="Hourly Verified Pipe Production Report",
+            metadata=(
+                ("Date", table.shift.start.strftime("%d-%m-%Y")),
+                ("Shift", table.shift.display_name),
+            ),
+            headers=("Time Interval", *table.caster_labels),
+            rows=rows,
+        )
+
+        for result in results:
+            result.state["verified_table_image_path"] = str(saved_path)
+            self._save_state(window, result)
+        logger.info(
+            "Hourly verified table image saved | window=%s | casters=%s | path=%s",
+            window.display,
+            [result.caster.id for result in results],
+            saved_path,
+        )
+        return saved_path
+
     def _send_consolidated_email(
         self,
         report_type: str,
@@ -819,6 +915,7 @@ class HourlyCsvWorkflow:
         results: list[HourlyCasterResult],
         *,
         mailer: EmailSender | None = None,
+        verified_table: HourlyVerifiedTable | None = None,
     ) -> bool:
         sent_key = f"{report_type}_email_sent"
         path_attribute = "raw_path" if report_type == "raw" else "verified_path"
@@ -858,7 +955,12 @@ class HourlyCsvWorkflow:
             return False
 
         started = time.perf_counter()
-        content = self._email_content(report_type, window, valid_results)
+        content = self._email_content(
+            report_type,
+            window,
+            valid_results,
+            verified_table=verified_table,
+        )
         content_elapsed = time.perf_counter() - started
         logger.info(
             "Email timing | report=%s | content_build=%.3fs | html_body=%.3fs",
@@ -912,7 +1014,13 @@ class HourlyCsvWorkflow:
         return True
 
     def _finish_result(self, window: HourlyWindow, result: HourlyCasterResult):
-        exports_ok = bool(result.raw_path and result.verified_path)
+        image_path = result.state.get("verified_table_image_path")
+        exports_ok = bool(
+            result.raw_path
+            and result.verified_path
+            and image_path
+            and Path(image_path).exists()
+        )
         emails_ok = bool(
             result.state.get("raw_email_sent")
             and result.state.get("verified_email_sent")
@@ -975,6 +1083,35 @@ class HourlyCsvWorkflow:
         verified_export_seconds = time.perf_counter() - verified_started
         logger.info("PERFORMANCE | verified_export=%.3fs", verified_export_seconds)
 
+        table_image_seconds = 0.0
+        verified_table = None
+        verified_results = [
+            result
+            for result in active_results
+            if result.verified_path and Path(result.verified_path).exists()
+        ]
+        if verified_results:
+            table_image_started = time.perf_counter()
+            try:
+                verified_table = self._verified_shift_table(window, verified_results)
+                self._save_verified_table_image(
+                    window,
+                    verified_results,
+                    table=verified_table,
+                )
+            except Exception:
+                detail = traceback.format_exc()
+                for result in verified_results:
+                    self._record_error(
+                        window,
+                        result,
+                        "Hourly verified table image export failed",
+                        detail=detail,
+                    )
+                logger.exception("Hourly verified table image export failed")
+            table_image_seconds = time.perf_counter() - table_image_started
+            logger.info("PERFORMANCE | verified_table_image=%.3fs", table_image_seconds)
+
         raw_email_seconds = 0.0
         verified_email_seconds = 0.0
         email_session_seconds = 0.0
@@ -1017,6 +1154,7 @@ class HourlyCsvWorkflow:
                         window,
                         active_results,
                         mailer=mailer,
+                        verified_table=verified_table,
                     )
                     verified_email_seconds = time.perf_counter() - started
                     logger.info("PERFORMANCE | verified_email=%.3fs", verified_email_seconds)
@@ -1034,10 +1172,12 @@ class HourlyCsvWorkflow:
             success,
         )
         logger.info(
-            "PERFORMANCE | raw_export=%.3fs | verified_export=%.3fs | raw_email=%.3fs | "
-            "verified_email=%.3fs | email_session=%.3fs | total=%.3fs",
+            "PERFORMANCE | raw_export=%.3fs | verified_export=%.3fs | "
+            "verified_table_image=%.3fs | raw_email=%.3fs | verified_email=%.3fs | "
+            "email_session=%.3fs | total=%.3fs",
             raw_export_seconds,
             verified_export_seconds,
+            table_image_seconds,
             raw_email_seconds,
             verified_email_seconds,
             email_session_seconds,

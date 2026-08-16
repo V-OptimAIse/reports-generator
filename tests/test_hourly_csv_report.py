@@ -329,6 +329,7 @@ class HourlyCsvWorkflowTest(TestCase):
                 selected_ids=["caster3"],
                 send_email=False,
             )
+            workflow.root = output_root
             workflow.state_dir = output_root / "state"
             first_window = HourlyWindow.from_cli("08-08-2026", "02:00", "03:00")
             second_window = HourlyWindow.from_cli("08-08-2026", "03:00", "04:00")
@@ -451,16 +452,20 @@ class HourlyCsvWorkflowTest(TestCase):
                 patch("cli.hourly_csv_report.EmailSender", FakeMailer),
             ):
                 workflow = HourlyCsvWorkflow(cfg=_cfg(), selected_ids=["caster3"])
+                workflow.root = output_root
                 workflow.state_dir = output_root / "state"
                 self.assertTrue(workflow.run(window))
 
                 # A new systemd/manual invocation for the same successful window is idempotent.
                 second_workflow = HourlyCsvWorkflow(cfg=_cfg(), selected_ids=["caster3"])
+                second_workflow.root = output_root
                 second_workflow.state_dir = workflow.state_dir
                 self.assertTrue(second_workflow.run(window))
 
             state_path = workflow._state_path(window, workflow.casters[0])
             state = json.loads(state_path.read_text())
+            table_image_path = Path(state["verified_table_image_path"])
+            table_image_bytes = table_image_path.read_bytes()
 
         self.assertEqual(
             [event[0] for event in events],
@@ -478,6 +483,10 @@ class HourlyCsvWorkflowTest(TestCase):
         self.assertEqual(state["status"], "success")
         self.assertTrue(state["raw_email_sent"])
         self.assertTrue(state["verified_email_sent"])
+        self.assertEqual(table_image_path.parent.name, "hourly-report-images")
+        self.assertTrue(table_image_path.name.startswith("verified_hourly_report_"))
+        self.assertTrue(table_image_bytes.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertGreater(len(table_image_bytes), 1_000)
 
     def test_no_email_generates_both_csvs_without_constructing_mailer(self):
         events = []
@@ -516,14 +525,17 @@ class HourlyCsvWorkflowTest(TestCase):
                     selected_ids=["caster3"],
                     send_email=False,
                 )
+                workflow.root = output_root
                 workflow.state_dir = output_root / "state"
                 self.assertTrue(workflow.run(window))
 
             state = json.loads(workflow._state_path(window, workflow.casters[0]).read_text())
+            table_image_bytes = Path(state["verified_table_image_path"]).read_bytes()
 
         self.assertEqual(events, ["raw", "verified"])
         mailer.assert_not_called()
         self.assertEqual(state["status"], "generated_no_email")
+        self.assertTrue(table_image_bytes.startswith(b"\x89PNG\r\n\x1a\n"))
 
 
 if __name__ == "__main__":

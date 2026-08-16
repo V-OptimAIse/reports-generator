@@ -82,6 +82,9 @@ shift, and the verified email table does the same for its hourly counts. For
 example, the 03:00-04:00 email attachments include both the 02:00-03:00 and
 03:00-04:00 data. Only the new hour is queried and verified; saved CSV data is
 reused for earlier hours.
+Each run also saves the verified hourly table as a PNG in
+`outputs/hourly-report-images`. This image is generated even with `--no-email`,
+and its path is recorded as `verified_table_image_path` in hourly state.
 Successful windows are recorded under `outputs/state/hourly`, so a repeated systemd
 activation does not resend the same report. Use `--force` only when an intentional
 resend is required.

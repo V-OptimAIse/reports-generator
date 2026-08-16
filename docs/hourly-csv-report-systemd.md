@@ -10,6 +10,9 @@ This job emails two reports for every completed clock hour:
 It does not run diagnosis XLSX generation, videos, Google Drive uploads, or history
 cleanup. The existing shift workflow and its systemd jobs remain unchanged.
 
+The verified shift-summary table is also saved as a PNG under
+`outputs/hourly-report-images`, including when the command uses `--no-email`.
+
 The systemd command omits an explicit date and time. The CLI then selects the
 previous completed hour. For example, a run at `02:05` reports `01:00:00` through
 `02:00:00`:
