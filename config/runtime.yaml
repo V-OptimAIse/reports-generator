@@ -64,16 +64,12 @@ workflow:
   max_runtime_seconds: 25200
   video_upload_workers: 2
 
-# Hourly raw and verified CSV emails go only to these test recipients.
-# These overrides do not change the shift-report recipient lists below.
+# Hourly reports are stored locally; this workflow never sends email.
 hourly_csv_report:
   image_dir: outputs/hourly-report-images
-  raw_recipients:
-    - karikutisasikumar1301@gmail.com
-    - punithsai2001@gmail.com
-  verified_recipients:
-    - karikutisasikumar1301@gmail.com
-    - punithsai2001@gmail.com
+  # CSVs use each caster's outputs.csv_dir. Hourly CSVs, table images, and
+  # workflow state older than this are removed at the start of every hourly run.
+  retention_days: 7
 
 verified_pipe_records_recipients:
   - punithsai2001@gmail.com

@@ -1,5 +1,5 @@
 import json
-import smtplib
+import os
 import sqlite3
 from contextlib import closing
 from datetime import datetime
@@ -25,15 +25,6 @@ def _cfg():
             ],
         },
         "outputs": {"csv_dir": "outputs/csv"},
-        "email": {
-            "sender": "sender@example.com",
-            "password": "secret",
-            "recipients": ["raw@example.com"],
-            "test_recipients": ["test@example.com"],
-            "smtp_server": "smtp.example.com",
-            "smtp_port": 587,
-        },
-        "verified_pipe_records_recipients": ["verified@example.com"],
         "verified_pipes_mode": "loadcell",
         "casters": {
             "defaults": {
@@ -112,7 +103,10 @@ class HourlyExporterBoundaryTest(TestCase):
                             weight_quality, weight_samples, state, last_seen_ts
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
-                        (uid, uid, 1, timestamp, timestamp, timestamp, 1.0, "ok", 1, "done", timestamp),
+                        (
+                            uid, uid, 1, timestamp, timestamp, timestamp,
+                            1.0, "ok", 1, "done", timestamp,
+                        ),
                     )
                 con.commit()
 
@@ -190,19 +184,7 @@ class HourlyExporterBoundaryTest(TestCase):
 
 
 class HourlyCsvWorkflowTest(TestCase):
-    def test_email_retry_classification_skips_permanent_smtp_errors(self):
-        self.assertFalse(HourlyCsvWorkflow._should_retry_email_error(
-            smtplib.SMTPAuthenticationError(535, b"invalid credentials")
-        ))
-        self.assertFalse(HourlyCsvWorkflow._should_retry_email_error(
-            smtplib.SMTPDataError(550, b"rejected")
-        ))
-        self.assertTrue(HourlyCsvWorkflow._should_retry_email_error(
-            smtplib.SMTPDataError(451, b"try again")
-        ))
-        self.assertTrue(HourlyCsvWorkflow._should_retry_email_error(TimeoutError()))
-
-    def test_verified_email_uses_html_table_with_enabled_casters_and_saved_counts(self):
+    def test_verified_table_uses_enabled_casters_and_saved_counts(self):
         with TemporaryDirectory() as tmp:
             workflow = HourlyCsvWorkflow(cfg=_cfg())
             workflow.state_dir = Path(tmp) / "state"
@@ -226,29 +208,16 @@ class HourlyCsvWorkflowTest(TestCase):
                 HourlyCasterResult(caster=caster2, verified_summary={"verified_count": 16}),
                 HourlyCasterResult(caster=caster3, verified_summary={"verified_count": 16}),
             ]
-            _, body = workflow._email_subject_and_body(
-                "verified",
-                current_window,
-                current_results,
-            )
+            table = workflow._verified_shift_table(current_window, current_results)
 
-        self.assertTrue(body.startswith("<!doctype html>"))
-        self.assertIn("Hourly Verified Pipe Production Report</h1>", body)
-        self.assertIn("max-width:680px", body)
-        self.assertIn("font-family:Arial, Helvetica, sans-serif", body)
-        self.assertIn('<table role="table"', body)
-        self.assertIn(">Time Interval</th>", body)
-        self.assertIn(">Caster 2</th>", body)
-        self.assertIn(">Caster 3</th>", body)
-        self.assertIn(">06:00 – 07:00</td>", body)
-        self.assertIn(">13:00 – 14:00</td>", body)
-        self.assertIn(">Total Count</td>", body)
-        self.assertIn(">28</td>", body)
-        self.assertIn(">42</td>", body)
-        self.assertIn("2 CSV files attached</p>", body)
-        self.assertNotIn("+---------------+", body)
+        self.assertEqual(table.caster_labels, ("Caster 2", "Caster 3"))
+        self.assertEqual(table.rows[0], ("06:00 – 07:00", ("0", "12")))
+        self.assertEqual(table.rows[1], ("07:00 – 08:00", ("12", "14")))
+        self.assertEqual(table.rows[2], ("08:00 – 09:00", ("16", "16")))
+        self.assertEqual(table.rows[-1][0], "13:00 – 14:00")
+        self.assertEqual(table.total_values, ("28", "42"))
 
-    def test_verified_email_builds_rows_for_all_three_configured_shifts(self):
+    def test_verified_table_builds_rows_for_all_three_configured_shifts(self):
         cases = (
             (
                 "08-08-2026", "06:00", "07:00", "08-08-2026", "A",
@@ -274,23 +243,12 @@ class HourlyCsvWorkflowTest(TestCase):
             for date_str, start, stop, shift_date, shift_name, first_row, last_row in cases:
                 with self.subTest(shift=shift_name):
                     window = HourlyWindow.from_cli(date_str, start, stop)
-                    _, body = workflow._email_subject_and_body("verified", window, [result])
+                    table = workflow._verified_shift_table(window, [result])
 
-                    self.assertIn(f">Date:</span> {shift_date}</td>", body)
-                    self.assertIn(f">Shift:</span> {shift_name}</td>", body)
-                    self.assertIn(f">{first_row}</td>", body)
-                    self.assertIn(f">{last_row}</td>", body)
-
-    def test_raw_email_body_keeps_the_existing_window_format(self):
-        workflow = HourlyCsvWorkflow(cfg=_cfg(), selected_ids=["caster3"])
-        window = HourlyWindow.from_cli("08-08-2026", "06:00", "07:00")
-        result = HourlyCasterResult(caster=workflow.casters[0], raw_count=4)
-
-        _, body = workflow._email_subject_and_body("raw", window, [result])
-
-        self.assertIn("Window : 06:00:00 to 07:00:00", body)
-        self.assertIn("Caster 3 : 4", body)
-        self.assertNotIn("SHIFT :", body)
+                    self.assertEqual(table.shift.start.strftime("%d-%m-%Y"), shift_date)
+                    self.assertEqual(table.shift.display_name, shift_name)
+                    self.assertEqual(table.rows[0][0], first_row)
+                    self.assertEqual(table.rows[-1][0], last_row)
 
     def test_raw_and_verified_csvs_accumulate_completed_hours_in_the_same_shift(self):
         with TemporaryDirectory() as tmp:
@@ -327,7 +285,6 @@ class HourlyCsvWorkflowTest(TestCase):
             workflow = HourlyCsvWorkflow(
                 cfg=_cfg(),
                 selected_ids=["caster3"],
-                send_email=False,
             )
             workflow.root = output_root
             workflow.state_dir = output_root / "state"
@@ -389,9 +346,8 @@ class HourlyCsvWorkflowTest(TestCase):
             ["raw_0200.csv", "raw_0300.csv", "raw_0600.csv"],
         )
 
-    def test_sends_only_consolidated_raw_and_verified_csv_emails(self):
+    def test_saves_csvs_and_table_image_locally_and_is_idempotent(self):
         events = []
-        sent_messages = []
 
         with TemporaryDirectory() as tmp:
             output_root = Path(tmp)
@@ -416,40 +372,10 @@ class HourlyCsvWorkflowTest(TestCase):
                     path.write_text("Pipe Number,Origin Time\n1,2026-08-08 01:10:00\n")
                     return path, {"verified_count": 1, "removed_count": 0}
 
-            class FakeMailer:
-                instances = 0
-
-                def __init__(self, cfg=None):
-                    self.__class__.instances += 1
-
-                def __enter__(self):
-                    return self
-
-                def __exit__(self, exc_type, exc_value, traceback):
-                    return False
-
-                def send(
-                    self,
-                    subject,
-                    body,
-                    attachments=None,
-                    recipients=None,
-                    html_body=None,
-                ):
-                    events.append(("email", "verified" if html_body else "raw"))
-                    sent_messages.append({
-                        "subject": subject,
-                        "body": body,
-                        "html_body": html_body,
-                        "attachments": list(attachments or []),
-                        "recipients": list(recipients or []),
-                    })
-
             window = HourlyWindow.from_cli("08-08-2026", "01:00", "02:00")
             with (
                 patch("cli.hourly_csv_report.PipeExporter", FakePipeExporter),
                 patch("cli.hourly_csv_report.VerifiedPipeExporter", FakeVerifiedExporter),
-                patch("cli.hourly_csv_report.EmailSender", FakeMailer),
             ):
                 workflow = HourlyCsvWorkflow(cfg=_cfg(), selected_ids=["caster3"])
                 workflow.root = output_root
@@ -469,73 +395,84 @@ class HourlyCsvWorkflowTest(TestCase):
 
         self.assertEqual(
             [event[0] for event in events],
-            ["raw", "verified", "email", "email"],
+            ["raw", "verified"],
         )
-        self.assertEqual(FakeMailer.instances, 1)
-        self.assertEqual(len(sent_messages), 2)
-        self.assertIn("Hourly Raw Pipe", sent_messages[0]["subject"])
-        self.assertEqual(sent_messages[0]["recipients"], ["raw@example.com"])
-        self.assertIsNone(sent_messages[0]["html_body"])
-        self.assertIn("Hourly Verified Pipe", sent_messages[1]["subject"])
-        self.assertEqual(sent_messages[1]["recipients"], ["verified@example.com"])
-        self.assertIn("<table", sent_messages[1]["html_body"])
-        self.assertNotIn("<table", sent_messages[1]["body"])
         self.assertEqual(state["status"], "success")
-        self.assertTrue(state["raw_email_sent"])
-        self.assertTrue(state["verified_email_sent"])
+        self.assertNotIn("raw_email_sent", state)
+        self.assertNotIn("verified_email_sent", state)
         self.assertEqual(table_image_path.parent.name, "hourly-report-images")
         self.assertTrue(table_image_path.name.startswith("verified_hourly_report_"))
         self.assertTrue(table_image_bytes.startswith(b"\x89PNG\r\n\x1a\n"))
         self.assertGreater(len(table_image_bytes), 1_000)
 
-    def test_no_email_generates_both_csvs_without_constructing_mailer(self):
-        events = []
-
+    def test_cleanup_deletes_only_hourly_files_older_than_seven_days(self):
         with TemporaryDirectory() as tmp:
             output_root = Path(tmp)
+            image_dir = output_root / "outputs" / "hourly-report-images"
+            csv_dir = output_root / "outputs" / "caster3" / "csv"
+            other_caster_csv_dir = output_root / "outputs" / "caster2" / "csv"
+            state_dir = output_root / "outputs" / "state" / "hourly"
+            for directory in (image_dir, csv_dir, other_caster_csv_dir, state_dir):
+                directory.mkdir(parents=True)
 
-            class FakePipeExporter:
-                def __init__(self, cfg=None, caster=None):
-                    self.caster = caster
+            cfg = _cfg()
+            cfg["hourly_csv_report"] = {
+                "image_dir": "outputs/hourly-report-images",
+                "retention_days": 7,
+            }
+            workflow = HourlyCsvWorkflow(cfg=cfg, selected_ids=["caster3"])
+            workflow.root = output_root
+            workflow.state_dir = state_dir
 
-                def export_window(self, start, stop):
-                    events.append("raw")
-                    path = output_root / "raw.csv"
-                    path.write_text("pipe_uid,t_origin\n")
-                    return path, 0
+            old_hourly_csv = csv_dir / "pipes_caster3_10082026_window_010000_020000.csv"
+            fresh_hourly_csv = csv_dir / "verified_pipes_caster3_11082026_window_010000_020000.csv"
+            old_other_caster_csv = (
+                other_caster_csv_dir
+                / "pipes_caster2_10082026_window_010000_020000.csv"
+            )
+            old_shift_csv = csv_dir / "pipes_caster3_10082026_shift_a_120000.csv"
+            old_image = image_dir / "verified_hourly_report_old.png"
+            fresh_image = image_dir / "verified_hourly_report_fresh.png"
+            old_state = state_dir / "caster3_old.json"
+            fresh_state = state_dir / "caster3_fresh.json"
+            files = (
+                old_hourly_csv,
+                fresh_hourly_csv,
+                old_other_caster_csv,
+                old_shift_csv,
+                old_image,
+                fresh_image,
+                old_state,
+                fresh_state,
+            )
+            for path in files:
+                path.write_text("test", encoding="utf-8")
 
-            class FakeVerifiedExporter:
-                def __init__(self, cfg=None, caster=None):
-                    self.caster = caster
-
-                def export_window(self, start, stop, raw_path, *, mode=None):
-                    events.append("verified")
-                    path = output_root / "verified.csv"
-                    path.write_text("Pipe Number,Origin Time\n")
-                    return path, {"verified_count": 0, "removed_count": 0}
-
-            window = HourlyWindow.from_cli("08-08-2026", "01:00", "02:00")
-            with (
-                patch("cli.hourly_csv_report.PipeExporter", FakePipeExporter),
-                patch("cli.hourly_csv_report.VerifiedPipeExporter", FakeVerifiedExporter),
-                patch("cli.hourly_csv_report.EmailSender") as mailer,
+            now = datetime(2026, 8, 17, 12, 0)
+            old_timestamp = (now.replace(day=9)).timestamp()
+            fresh_timestamp = (now.replace(day=11)).timestamp()
+            for path in (
+                old_hourly_csv,
+                old_other_caster_csv,
+                old_shift_csv,
+                old_image,
+                old_state,
             ):
-                workflow = HourlyCsvWorkflow(
-                    cfg=_cfg(),
-                    selected_ids=["caster3"],
-                    send_email=False,
-                )
-                workflow.root = output_root
-                workflow.state_dir = output_root / "state"
-                self.assertTrue(workflow.run(window))
+                os.utime(path, (old_timestamp, old_timestamp))
+            for path in (fresh_hourly_csv, fresh_image, fresh_state):
+                os.utime(path, (fresh_timestamp, fresh_timestamp))
 
-            state = json.loads(workflow._state_path(window, workflow.casters[0]).read_text())
-            table_image_bytes = Path(state["verified_table_image_path"]).read_bytes()
+            deleted = workflow.cleanup_expired_reports(now=now)
 
-        self.assertEqual(events, ["raw", "verified"])
-        mailer.assert_not_called()
-        self.assertEqual(state["status"], "generated_no_email")
-        self.assertTrue(table_image_bytes.startswith(b"\x89PNG\r\n\x1a\n"))
+            self.assertEqual(deleted, {"csv": 2, "images": 1, "state": 1})
+            self.assertFalse(old_hourly_csv.exists())
+            self.assertFalse(old_other_caster_csv.exists())
+            self.assertFalse(old_image.exists())
+            self.assertFalse(old_state.exists())
+            self.assertTrue(fresh_hourly_csv.exists())
+            self.assertTrue(fresh_image.exists())
+            self.assertTrue(fresh_state.exists())
+            self.assertTrue(old_shift_csv.exists())
 
 
 if __name__ == "__main__":

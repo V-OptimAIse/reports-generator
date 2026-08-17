@@ -4,13 +4,11 @@ import argparse
 import csv
 import json
 import logging
-import smtplib
 import sys
 import time
 import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from html import escape
 from pathlib import Path
 from typing import Callable
 
@@ -19,9 +17,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from reports.common.caster_config import CasterConfig, caster_label, resolve_enabled_casters
+from reports.common.caster_config import (
+    CasterConfig,
+    build_caster_runtime_config,
+    caster_label,
+    resolve_enabled_casters,
+)
 from reports.common.config_loader import load_runtime_config
-from reports.common.email_sender import EmailSender
 from reports.common.table_image import save_table_image
 from reports.pipes.pipe_exporter import PipeExporter
 from reports.pipes.verified_pipes import VerifiedPipeExporter
@@ -130,33 +132,22 @@ class HourlyVerifiedTable:
     total_values: tuple[str, ...]
 
 
-@dataclass(frozen=True)
-class HourlyEmailContent:
-    subject: str
-    text_body: str
-    html_body: str | None = None
-    verified_table: HourlyVerifiedTable | None = None
-
-
 class HourlyCsvWorkflow:
-    """Generate and email only raw and verified CSVs for a custom time window."""
+    """Save hourly raw/verified CSVs and a verified-count table image locally."""
 
     VERIFIED_CSV_COLUMNS = ("Pipe Number", "Origin Time")
+    DEFAULT_RETENTION_DAYS = 7
 
     def __init__(
         self,
         cfg: dict | None = None,
         selected_ids: list[str] | None = None,
         *,
-        test_mode: bool = False,
-        send_email: bool = True,
         force: bool = False,
     ):
         self.root = PROJECT_ROOT
         self.cfg = cfg or load_runtime_config()
         self.casters = resolve_enabled_casters(self.cfg, selected_ids)
-        self.test_mode = test_mode is True
-        self.send_email = send_email is True
         self.force = force is True
         self.state_dir = self.root / "outputs" / "state" / "hourly"
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -180,31 +171,112 @@ class HourlyCsvWorkflow:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(result.state, indent=2, sort_keys=True))
 
-    @staticmethod
-    def _normalize_recipients(value) -> list[str]:
-        if value is None:
-            return []
-        if isinstance(value, str):
-            value = [value]
-        return [str(item).strip() for item in value if str(item).strip()]
+    def _retention_days(self) -> int:
+        hourly_cfg = self.cfg.get("hourly_csv_report", {}) or {}
+        value = hourly_cfg.get("retention_days", self.DEFAULT_RETENTION_DAYS)
+        try:
+            days = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("hourly_csv_report.retention_days must be a positive integer") from exc
+        if days <= 0:
+            raise ValueError("hourly_csv_report.retention_days must be a positive integer")
+        return days
 
-    def _report_recipients(self, report_type: str, cfg: dict) -> list[str]:
-        email_cfg = cfg.get("email", {}) or {}
-        if self.test_mode:
-            return self._normalize_recipients(email_cfg.get("test_recipients"))
+    def _hourly_image_dir(self) -> Path:
+        hourly_cfg = self.cfg.get("hourly_csv_report", {}) or {}
+        image_dir = Path(str(hourly_cfg.get("image_dir") or "outputs/hourly-report-images"))
+        return image_dir if image_dir.is_absolute() else self.root / image_dir
 
-        hourly_cfg = cfg.get("hourly_csv_report", {}) or {}
-        if report_type == "raw":
-            configured = hourly_cfg.get("raw_recipients")
-            return self._normalize_recipients(
-                configured if configured is not None else email_cfg.get("recipients")
+    def _hourly_csv_dirs(self) -> set[Path]:
+        directories = set()
+        caster_configs = [caster.cfg for caster in self.casters]
+        casters_cfg = self.cfg.get("casters")
+        if isinstance(casters_cfg, dict):
+            defaults = casters_cfg.get("defaults") or {}
+            caster_configs.extend(
+                build_caster_runtime_config(self.cfg, item, defaults)
+                for item in (casters_cfg.get("items") or [])
+                if isinstance(item, dict)
             )
-        configured = hourly_cfg.get("verified_recipients")
-        return self._normalize_recipients(
-            configured
-            if configured is not None
-            else cfg.get("verified_pipe_records_recipients")
+
+        for caster_cfg in caster_configs:
+            csv_dir = Path(
+                str((caster_cfg.get("outputs", {}) or {}).get("csv_dir") or "outputs/csv")
+            )
+            directories.add(csv_dir if csv_dir.is_absolute() else self.root / csv_dir)
+        return directories
+
+    @staticmethod
+    def _delete_expired_files(
+        directory: Path,
+        *,
+        cutoff_timestamp: float,
+        matches: Callable[[Path], bool],
+    ) -> int:
+        if not directory.exists():
+            return 0
+
+        try:
+            candidates = list(directory.iterdir())
+        except OSError:
+            logger.warning("Could not inspect hourly report directory | path=%s", directory)
+            return 0
+
+        deleted = 0
+        for path in candidates:
+            try:
+                if (
+                    path.is_file()
+                    and matches(path)
+                    and path.stat().st_mtime < cutoff_timestamp
+                ):
+                    path.unlink()
+                    deleted += 1
+            except OSError:
+                logger.warning("Could not inspect or delete expired hourly report | path=%s", path)
+        return deleted
+
+    def cleanup_expired_reports(self, *, now: datetime | None = None) -> dict[str, int]:
+        """Delete only hourly-owned report files older than the configured lifespan."""
+        current = now or datetime.now()
+        cutoff = (current - timedelta(days=self._retention_days())).timestamp()
+
+        deleted_csvs = sum(
+            self._delete_expired_files(
+                directory,
+                cutoff_timestamp=cutoff,
+                matches=lambda path: path.suffix.lower() == ".csv" and "_window_" in path.name,
+            )
+            for directory in self._hourly_csv_dirs()
         )
+        deleted_images = self._delete_expired_files(
+            self._hourly_image_dir(),
+            cutoff_timestamp=cutoff,
+            matches=lambda path: (
+                path.suffix.lower() == ".png"
+                and path.name.startswith("verified_hourly_report_")
+            ),
+        )
+        deleted_states = self._delete_expired_files(
+            self.state_dir,
+            cutoff_timestamp=cutoff,
+            matches=lambda path: path.suffix.lower() == ".json",
+        )
+        deleted = {
+            "csv": deleted_csvs,
+            "images": deleted_images,
+            "state": deleted_states,
+        }
+        if any(deleted.values()):
+            logger.info(
+                "Expired hourly reports deleted | retention_days=%s | csv=%s | "
+                "images=%s | state=%s",
+                self._retention_days(),
+                deleted_csvs,
+                deleted_images,
+                deleted_states,
+            )
+        return deleted
 
     @staticmethod
     def _verified_mode(cfg: dict) -> str:
@@ -235,7 +307,8 @@ class HourlyCsvWorkflow:
                     break
                 if should_retry is not None and not should_retry(exc):
                     logger.error(
-                        "%s failed with a non-retryable error; stopping after attempt %s/%s | error=%s",
+                        "%s failed with a non-retryable error; stopping after "
+                        "attempt %s/%s | error=%s",
                         what,
                         attempt,
                         tries,
@@ -255,29 +328,6 @@ class HourlyCsvWorkflow:
         raise RuntimeError(
             f"{what} failed after {attempts_made} attempt(s): {last_error}"
         ) from last_error
-
-    @staticmethod
-    def _should_retry_email_error(exc: Exception) -> bool:
-        if isinstance(
-            exc,
-            (
-                smtplib.SMTPAuthenticationError,
-                smtplib.SMTPNotSupportedError,
-                smtplib.SMTPRecipientsRefused,
-            ),
-        ):
-            return False
-        if isinstance(exc, smtplib.SMTPResponseException):
-            return 400 <= exc.smtp_code < 500
-        return isinstance(
-            exc,
-            (
-                TimeoutError,
-                ConnectionError,
-                OSError,
-                smtplib.SMTPException,
-            ),
-        )
 
     def _record_error(
         self,
@@ -300,7 +350,7 @@ class HourlyCsvWorkflow:
         state = {} if self.force else self._load_state(window, caster)
         if state.get("status") == "success" and not self.force:
             logger.info(
-                "Hourly report already sent; skipping | caster=%s | window=%s",
+                "Hourly report already generated; skipping | caster=%s | window=%s",
                 caster.id,
                 window.display,
             )
@@ -313,8 +363,6 @@ class HourlyCsvWorkflow:
             "window_stop": window.stop.isoformat(timespec="seconds"),
             "caster_id": caster.id,
             "caster_number": caster.number,
-            "email_test_mode": self.test_mode,
-            "email_enabled": self.send_email,
             "started_at": datetime.now().isoformat(timespec="seconds"),
             "status": "running",
         })
@@ -339,7 +387,11 @@ class HourlyCsvWorkflow:
             result.raw_path = str(previous_path)
             result.raw_hour_path = str(previous_hour_path)
             result.raw_count = result.state.get("raw_count", 0)
-            logger.info("Reusing hourly raw CSV | caster=%s | path=%s", result.caster.id, previous_path)
+            logger.info(
+                "Reusing hourly raw CSV | caster=%s | path=%s",
+                result.caster.id,
+                previous_path,
+            )
             return
 
         exporter = PipeExporter(cfg=result.caster.cfg, caster=result.caster)
@@ -584,65 +636,14 @@ class HourlyCsvWorkflow:
         )
         return cumulative_path, len(origin_times)
 
-    def _email_content(
-        self,
-        report_type: str,
-        window: HourlyWindow,
-        results: list[HourlyCasterResult],
-        *,
-        verified_table: HourlyVerifiedTable | None = None,
-    ) -> HourlyEmailContent:
-        report_name = "Raw Pipe" if report_type == "raw" else "Verified Pipe"
-        subject = (
-            f"Hourly {report_name} Production Report - "
-            f"{window.start:%d-%m-%Y} - {window.start:%H:%M:%S} to {window.stop:%H:%M:%S}"
-        )
-        if self.test_mode:
-            subject = f"[TEST] {subject}"
-
-        if report_type == "verified":
-            table = verified_table or self._verified_shift_table(window, results)
-            text_body, html_body = self._verified_shift_email_bodies(
-                window,
-                results,
-                table=table,
-            )
-            return HourlyEmailContent(
-                subject=subject,
-                text_body=text_body,
-                html_body=html_body,
-                verified_table=table,
-            )
-
-        lines = [
-            f"Hourly {report_name} Production Report",
-            "",
-            f"Window : {window.display}",
-            "",
-        ]
-        for result in results:
-            count = result.raw_count
-            lines.append(f"{caster_label(result.caster, result.caster.cfg)} : {count}")
-        lines.extend(["", f"{len(results)} CSV file(s) attached."])
-        return HourlyEmailContent(subject=subject, text_body="\n".join(lines))
-
-    def _email_subject_and_body(
-        self,
-        report_type: str,
-        window: HourlyWindow,
-        results: list[HourlyCasterResult],
-    ) -> tuple[str, str]:
-        """Compatibility helper returning the primary rendered body."""
-        content = self._email_content(report_type, window, results)
-        return content.subject, content.html_body or content.text_body
-
     def _shift_for_window(self, window: HourlyWindow) -> HourlyShift:
         configured = ((self.cfg.get("history", {}) or {}).get("shifts", []) or [])
         if not configured:
             raise ValueError("history.shifts is required for the hourly verified report table")
 
         for item in configured:
-            if not isinstance(item, dict) or not all(key in item for key in ("name", "start", "end")):
+            required_keys = ("name", "start", "end")
+            if not isinstance(item, dict) or not all(key in item for key in required_keys):
                 raise ValueError("Each history.shifts item must define name, start, and end")
 
             start_clock = HourlyWindow._parse_clock(str(item["start"]), "shift start")
@@ -723,149 +724,17 @@ class HourlyCsvWorkflow:
             total_values=tuple(total_values),
         )
 
-    def _verified_shift_email_bodies(
-        self,
-        window: HourlyWindow,
-        results: list[HourlyCasterResult],
-        *,
-        table: HourlyVerifiedTable | None = None,
-    ) -> tuple[str, str]:
-        table = table or self._verified_shift_table(window, results)
-        shift = table.shift
-        caster_labels = table.caster_labels
-        rows = table.rows
-        total_values = table.total_values
-        attachment_count = len(results)
-        attachment_text = (
-            f"{attachment_count} CSV "
-            f"{'file' if attachment_count == 1 else 'files'} attached"
-        )
-
-        text_lines = [
-            "Hourly Verified Pipe Production Report",
-            "",
-            f"Date: {shift.start:%d-%m-%Y}",
-            f"Shift: {shift.display_name}",
-            "",
-        ]
-        for interval, counts in rows:
-            values = ", ".join(
-                f"{label}: {count or '-'}"
-                for label, count in zip(caster_labels, counts)
-            )
-            text_lines.append(f"{interval} — {values}")
-        total_text = ", ".join(
-            f"{label}: {total or '-'}"
-            for label, total in zip(caster_labels, total_values)
-        )
-        text_lines.extend([
-            "",
-            f"Total Count — {total_text}",
-            "",
-            attachment_text,
-        ])
-
-        header_cells = "".join(
-            (
-                '<th align="left" style="padding:11px 12px; border:1px solid #cbd5e1; '
-                'background-color:#e8eef5; color:#17324d; font-size:13px; '
-                'font-weight:700; line-height:18px; text-align:left; white-space:nowrap;">'
-                'Time Interval</th>'
-                if index == 0
-                else '<th align="center" style="padding:11px 12px; border:1px solid #cbd5e1; '
-                'background-color:#e8eef5; color:#17324d; font-size:13px; '
-                'font-weight:700; line-height:18px; text-align:center; white-space:nowrap;">'
-                f'{escape(label)}</th>'
-            )
-            for index, label in enumerate(["Time Interval", *caster_labels])
-        )
-
-        data_rows = []
-        for row_index, (interval, counts) in enumerate(rows):
-            background = "#ffffff" if row_index % 2 == 0 else "#f7f9fc"
-            count_cells = "".join(
-                '<td align="center" style="padding:10px 12px; border:1px solid #d6dce3; '
-                f'background-color:{background}; color:#263746; font-size:13px; '
-                'line-height:18px; text-align:center;">'
-                f'{escape(count) if count else "&nbsp;"}</td>'
-                for count in counts
-            )
-            data_rows.append(
-                '<tr>'
-                '<td align="left" style="padding:10px 12px; border:1px solid #d6dce3; '
-                f'background-color:{background}; color:#263746; font-size:13px; '
-                'line-height:18px; text-align:left; white-space:nowrap;">'
-                f'{escape(interval)}</td>{count_cells}</tr>'
-            )
-
-        total_cells = "".join(
-            '<td align="center" style="padding:11px 12px; border:1px solid #b8c5d1; '
-            'background-color:#dfe8f1; color:#17324d; font-size:13px; font-weight:700; '
-            'line-height:18px; text-align:center;">'
-            f'{escape(total) if total else "&nbsp;"}</td>'
-            for total in total_values
-        )
-        total_row = (
-            '<tr><td align="left" style="padding:11px 12px; border:1px solid #b8c5d1; '
-            'background-color:#dfe8f1; color:#17324d; font-size:13px; font-weight:700; '
-            'line-height:18px; text-align:left; white-space:nowrap;">Total Count</td>'
-            f'{total_cells}</tr>'
-        )
-
-        html_body = (
-            '<!doctype html>'
-            '<html lang="en"><head><meta charset="utf-8">'
-            '<meta name="viewport" content="width=device-width, initial-scale=1.0">'
-            '<title>Hourly Verified Pipe Production Report</title></head>'
-            '<body style="margin:0; padding:0; background-color:#f2f5f8; '
-            'font-family:Arial, Helvetica, sans-serif; color:#263746;">'
-            '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" '
-            'style="width:100%; border-collapse:collapse; background-color:#f2f5f8;">'
-            '<tr><td align="center" style="padding:24px 12px;">'
-            '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" '
-            'style="width:100%; max-width:680px; border-collapse:separate; border-spacing:0; '
-            'background-color:#ffffff; border:1px solid #d9e0e7; border-radius:10px;">'
-            '<tr><td style="padding:28px 24px 24px 24px;">'
-            '<h1 style="margin:0 0 20px 0; color:#17324d; font-size:22px; font-weight:700; '
-            'line-height:29px;">Hourly Verified Pipe Production Report</h1>'
-            '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" '
-            'style="width:100%; margin:0 0 20px 0; border-collapse:collapse;">'
-            '<tr><td width="50%" style="padding:10px 12px; background-color:#f7f9fc; '
-            'border:1px solid #e0e5eb; color:#526474; font-size:13px; line-height:18px;">'
-            '<span style="font-weight:700; color:#17324d;">Date:</span> '
-            f'{escape(shift.start.strftime("%d-%m-%Y"))}</td>'
-            '<td width="50%" style="padding:10px 12px; background-color:#f7f9fc; '
-            'border:1px solid #e0e5eb; color:#526474; font-size:13px; line-height:18px;">'
-            '<span style="font-weight:700; color:#17324d;">Shift:</span> '
-            f'{escape(shift.display_name)}</td></tr></table>'
-            '<div style="width:100%; overflow-x:auto; border-radius:7px;">'
-            '<table role="table" width="100%" cellspacing="0" cellpadding="0" border="0" '
-            'style="width:100%; border-collapse:collapse; border-spacing:0;">'
-            f'<thead><tr>{header_cells}</tr></thead>'
-            f'<tbody>{"".join(data_rows)}{total_row}</tbody>'
-            '</table></div>'
-            '<p style="margin:18px 0 0 0; color:#617383; font-size:12px; line-height:18px;">'
-            f'{escape(attachment_text)}</p>'
-            '</td></tr></table></td></tr></table></body></html>'
-        )
-        return "\n".join(text_lines), html_body
-
     def _verified_table_image_path(
         self,
         window: HourlyWindow,
         results: list[HourlyCasterResult],
     ) -> Path:
-        hourly_cfg = self.cfg.get("hourly_csv_report", {}) or {}
-        image_dir = Path(str(hourly_cfg.get("image_dir") or "outputs/hourly-report-images"))
-        if not image_dir.is_absolute():
-            image_dir = self.root / image_dir
-
         caster_token = "_".join(result.caster.id for result in results)
         caster_token = "".join(
             character if character.isalnum() or character in {"-", "_"} else "_"
             for character in caster_token
         )
-        return image_dir / (
+        return self._hourly_image_dir() / (
             f"verified_hourly_report_{window.state_token}_{caster_token}.png"
         )
 
@@ -908,111 +777,6 @@ class HourlyCsvWorkflow:
         )
         return saved_path
 
-    def _send_consolidated_email(
-        self,
-        report_type: str,
-        window: HourlyWindow,
-        results: list[HourlyCasterResult],
-        *,
-        mailer: EmailSender | None = None,
-        verified_table: HourlyVerifiedTable | None = None,
-    ) -> bool:
-        sent_key = f"{report_type}_email_sent"
-        path_attribute = "raw_path" if report_type == "raw" else "verified_path"
-        eligible = [result for result in results if not result.state.get(sent_key)]
-        if not eligible:
-            return True
-
-        attachments = []
-        valid_results = []
-        for result in eligible:
-            path = getattr(result, path_attribute)
-            if not path or not Path(path).exists():
-                self._record_error(
-                    window,
-                    result,
-                    f"Hourly {report_type} email attachment is missing",
-                )
-                continue
-            attachments.append(path)
-            valid_results.append(result)
-        if not valid_results:
-            return False
-
-        recipients: list[str] = []
-        for result in valid_results:
-            for recipient in self._report_recipients(report_type, result.caster.cfg):
-                if recipient not in recipients:
-                    recipients.append(recipient)
-        if not recipients:
-            reason = (
-                "No email.test_recipients configured"
-                if self.test_mode
-                else f"No hourly {report_type} recipients configured"
-            )
-            for result in valid_results:
-                self._record_error(window, result, reason)
-            return False
-
-        started = time.perf_counter()
-        content = self._email_content(
-            report_type,
-            window,
-            valid_results,
-            verified_table=verified_table,
-        )
-        content_elapsed = time.perf_counter() - started
-        logger.info(
-            "Email timing | report=%s | content_build=%.3fs | html_body=%.3fs",
-            report_type,
-            content_elapsed,
-            content_elapsed if content.html_body is not None else 0.0,
-        )
-        send_kwargs = {
-            "attachments": attachments,
-            "recipients": recipients,
-        }
-        if content.html_body is not None:
-            send_kwargs["html_body"] = content.html_body
-        try:
-            active_mailer = mailer or EmailSender(cfg=valid_results[0].caster.cfg)
-            self._retry(
-                lambda: active_mailer.send(
-                    content.subject,
-                    content.text_body,
-                    **send_kwargs,
-                ),
-                what=f"hourly {report_type} CSV email",
-                tries=3,
-                base_delay=1.0,
-                should_retry=self._should_retry_email_error,
-            )
-        except Exception:
-            detail = traceback.format_exc()
-            for result in valid_results:
-                self._record_error(
-                    window,
-                    result,
-                    f"Hourly {report_type} CSV email failed",
-                    detail=detail,
-                )
-            logger.exception("Hourly %s CSV email failed", report_type)
-            return False
-
-        for result in valid_results:
-            result.state[sent_key] = True
-            result.state[f"{report_type}_email_recipients"] = recipients
-            self._save_state(window, result)
-        logger.info(
-            "Hourly %s CSV email sent | window=%s | casters=%s | attachments=%s | recipients=%s",
-            report_type,
-            window.display,
-            [result.caster.id for result in valid_results],
-            len(attachments),
-            len(recipients),
-        )
-        return True
-
     def _finish_result(self, window: HourlyWindow, result: HourlyCasterResult):
         image_path = result.state.get("verified_table_image_path")
         exports_ok = bool(
@@ -1021,16 +785,7 @@ class HourlyCsvWorkflow:
             and image_path
             and Path(image_path).exists()
         )
-        emails_ok = bool(
-            result.state.get("raw_email_sent")
-            and result.state.get("verified_email_sent")
-        )
-        if result.errors or not exports_ok or (self.send_email and not emails_ok):
-            status = "partial_failure"
-        elif self.send_email:
-            status = "success"
-        else:
-            status = "generated_no_email"
+        status = "partial_failure" if result.errors or not exports_ok else "success"
         result.state["errors"] = result.errors
         result.state["status"] = status
         result.state["finished_at"] = datetime.now().isoformat(timespec="seconds")
@@ -1038,13 +793,16 @@ class HourlyCsvWorkflow:
 
     def run(self, window: HourlyWindow) -> bool:
         workflow_started = time.perf_counter()
+        cleanup_started = time.perf_counter()
+        self.cleanup_expired_reports()
+        cleanup_seconds = time.perf_counter() - cleanup_started
         logger.info(
-            "Hourly CSV workflow start | window=%s | casters=%s | email=%s | test=%s | force=%s",
+            "Hourly local report workflow start | window=%s | casters=%s | "
+            "force=%s | retention_days=%s",
             window.display,
             [caster.id for caster in self.casters],
-            self.send_email,
-            self.test_mode,
             self.force,
+            self._retention_days(),
         )
         active_results = []
         raw_started = time.perf_counter()
@@ -1084,7 +842,6 @@ class HourlyCsvWorkflow:
         logger.info("PERFORMANCE | verified_export=%.3fs", verified_export_seconds)
 
         table_image_seconds = 0.0
-        verified_table = None
         verified_results = [
             result
             for result in active_results
@@ -1112,55 +869,6 @@ class HourlyCsvWorkflow:
             table_image_seconds = time.perf_counter() - table_image_started
             logger.info("PERFORMANCE | verified_table_image=%.3fs", table_image_seconds)
 
-        raw_email_seconds = 0.0
-        verified_email_seconds = 0.0
-        email_session_seconds = 0.0
-        if self.send_email and active_results:
-            email_session_started = time.perf_counter()
-            try:
-                mailer_started = time.perf_counter()
-                mailer = EmailSender(cfg=active_results[0].caster.cfg)
-                logger.info(
-                    "Email timing | workflow_mailer_initialization=%.3fs",
-                    time.perf_counter() - mailer_started,
-                )
-            except Exception:
-                detail = traceback.format_exc()
-                for report_type in ("raw", "verified"):
-                    for result in active_results:
-                        if not result.state.get(f"{report_type}_email_sent"):
-                            self._record_error(
-                                window,
-                                result,
-                                f"Hourly {report_type} email sender initialization failed",
-                                detail=detail,
-                            )
-                logger.exception("Hourly email sender initialization failed")
-            else:
-                with mailer:
-                    started = time.perf_counter()
-                    self._send_consolidated_email(
-                        "raw",
-                        window,
-                        active_results,
-                        mailer=mailer,
-                    )
-                    raw_email_seconds = time.perf_counter() - started
-                    logger.info("PERFORMANCE | raw_email=%.3fs", raw_email_seconds)
-
-                    started = time.perf_counter()
-                    self._send_consolidated_email(
-                        "verified",
-                        window,
-                        active_results,
-                        mailer=mailer,
-                        verified_table=verified_table,
-                    )
-                    verified_email_seconds = time.perf_counter() - started
-                    logger.info("PERFORMANCE | verified_email=%.3fs", verified_email_seconds)
-            email_session_seconds = time.perf_counter() - email_session_started
-            logger.info("PERFORMANCE | email_session=%.3fs", email_session_seconds)
-
         for result in active_results:
             self._finish_result(window, result)
 
@@ -1172,15 +880,12 @@ class HourlyCsvWorkflow:
             success,
         )
         logger.info(
-            "PERFORMANCE | raw_export=%.3fs | verified_export=%.3fs | "
-            "verified_table_image=%.3fs | raw_email=%.3fs | verified_email=%.3fs | "
-            "email_session=%.3fs | total=%.3fs",
+            "PERFORMANCE | cleanup=%.3fs | raw_export=%.3fs | verified_export=%.3fs | "
+            "verified_table_image=%.3fs | total=%.3fs",
+            cleanup_seconds,
             raw_export_seconds,
             verified_export_seconds,
             table_image_seconds,
-            raw_email_seconds,
-            verified_email_seconds,
-            email_session_seconds,
             time.perf_counter() - workflow_started,
         )
         return success
@@ -1197,7 +902,10 @@ def setup_logging(cfg: dict):
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Email raw and verified pipe CSVs for a custom or previous-hour window",
+        description=(
+            "Save raw/verified pipe CSVs and a table image for a custom or "
+            "previous-hour window"
+        ),
     )
     parser.add_argument("--date", help="Window start date in DD-MM-YYYY")
     parser.add_argument("--start", help="Window start time in HH:MM or HH:MM:SS")
@@ -1206,9 +914,11 @@ def build_parser() -> argparse.ArgumentParser:
     caster_group.add_argument("--caster", help="Single caster id, for example caster3")
     caster_group.add_argument("--casters", help="Comma-separated caster ids")
     caster_group.add_argument("--all-casters", action="store_true", help="Use every enabled caster")
-    parser.add_argument("--test", action="store_true", help="Send both emails only to email.test_recipients")
-    parser.add_argument("--no-email", action="store_true", help="Generate both CSVs without sending email")
-    parser.add_argument("--force", action="store_true", help="Regenerate and resend an already successful window")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Regenerate an already successful window",
+    )
     return parser
 
 
@@ -1245,8 +955,6 @@ def main() -> int:
         workflow = HourlyCsvWorkflow(
             cfg=cfg,
             selected_ids=_selected_ids_from_args(args),
-            test_mode=args.test,
-            send_email=not args.no_email,
             force=args.force,
         )
         return 0 if workflow.run(window) else 1
