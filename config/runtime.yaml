@@ -39,8 +39,8 @@ gate2_closed_position_report:
   source_resolution:
     width: 1310
     height: 608
-  # false = email only when the detected-Gate2-area-inside-ROI percent is below threshold.
-  # min_avg_coverage_percent applies to average detected Gate2 area inside roi_gate2_closed.
+  # false = email only when closed-position detection coverage is below threshold.
+  # Coverage includes only detections whose centroid satisfies the closed-position rule above.
   # true = also email when no YOLO samples exist in the interval.
   alert_on_no_samples: false
   send_email: true

@@ -50,7 +50,7 @@ ROI_SOURCE_KEYS = (
 class FrameCoverage:
     timestamp: datetime
     text_path: Path
-    coverage_percent: float
+    coverage_percent: float | None
     gate2_detection_count: int
     centroid_inside_count: int
     centroid_x_min: float | None = None
@@ -86,9 +86,13 @@ class Gate2ClosedPositionReport:
     For each sampled YOLO text frame:
       1. keep only gate2 detections,
       2. calculate each detection centroid,
-      3. count centroids inside roi_gate2_closed and outside roi_gate2_open,
-      4. calculate the percentage of detected Gate2 area inside roi_gate2_closed,
+      3. keep closed-position detections whose centroids are inside
+         roi_gate2_closed and outside roi_gate2_open,
+      4. calculate the percentage of each closed-position detection inside
+         roi_gate2_closed,
       5. use the best detection-inside-ROI percentage for that frame.
+
+    Frames without a closed-position detection are not coverage samples.
     """
 
     DEFAULT_INTERVAL_SECONDS = 10 * 60
@@ -696,7 +700,7 @@ class Gate2ClosedPositionReport:
         )
 
     def _measure_frame(self, timestamp: datetime, text_path: Path, frame_width: int, frame_height: int) -> FrameCoverage:
-        best_coverage = 0.0
+        best_coverage: float | None = None
         gate2_count = 0
         centroid_inside_count = 0
         centroids: list[Point] = []
@@ -722,14 +726,17 @@ class Gate2ClosedPositionReport:
 
                 centroid = self._yolo_centroid(xc, yc, frame_width, frame_height)
                 centroids.append(centroid)
-                if self._is_gate2_closed_centroid(centroid):
-                    centroid_inside_count += 1
+                if not self._is_gate2_closed_centroid(centroid):
+                    continue
+
+                centroid_inside_count += 1
 
                 intersection = self._convex_intersection(polygon, self.roi_points)
+                detection_inside_roi_percent = 0.0
                 if intersection:
                     intersection_area = self._polygon_area(intersection)
                     detection_inside_roi_percent = min((intersection_area / detection_area) * 100.0, 100.0)
-                    best_coverage = max(best_coverage, detection_inside_roi_percent)
+                best_coverage = max(best_coverage or 0.0, detection_inside_roi_percent)
 
         x_min, x_max, y_min, y_max = self._centroid_bounds(centroids)
         return FrameCoverage(
@@ -761,6 +768,7 @@ class Gate2ClosedPositionReport:
             "interval_start": start,
             "interval_end": end,
             "sample_count": 0,
+            "closed_position_sample_count": 0,
             "gate2_detection_count": 0,
             "centroid_inside_count": 0,
             "centroid_x_min": None,
@@ -786,7 +794,9 @@ class Gate2ClosedPositionReport:
         interval["sample_count"] += 1
         interval["gate2_detection_count"] += frame.gate2_detection_count
         interval["centroid_inside_count"] += frame.centroid_inside_count
-        interval["coverage_sum"] += frame.coverage_percent
+        if frame.coverage_percent is not None:
+            interval["closed_position_sample_count"] += 1
+            interval["coverage_sum"] += frame.coverage_percent
         interval["centroid_x_min"] = self._none_aware_min(interval["centroid_x_min"], frame.centroid_x_min)
         interval["centroid_x_max"] = self._none_aware_max(interval["centroid_x_max"], frame.centroid_x_max)
         interval["centroid_y_min"] = self._none_aware_min(interval["centroid_y_min"], frame.centroid_y_min)
@@ -794,10 +804,17 @@ class Gate2ClosedPositionReport:
 
     def _interval_row(self, interval: dict) -> dict:
         sample_count = interval["sample_count"]
-        avg_detection_inside_roi = interval["coverage_sum"] / sample_count if sample_count else 0.0
+        closed_position_sample_count = interval["closed_position_sample_count"]
+        avg_detection_inside_roi = (
+            interval["coverage_sum"] / closed_position_sample_count
+            if closed_position_sample_count
+            else None
+        )
         if sample_count == 0:
             status, alert = "NO_SAMPLES", bool(getattr(self, "alert_on_no_samples", True))
-        elif avg_detection_inside_roi >= self.threshold_percent:
+        elif closed_position_sample_count == 0:
+            status, alert = "NO_CLOSED_DETECTIONS", False
+        elif avg_detection_inside_roi is not None and avg_detection_inside_roi >= self.threshold_percent:
             status, alert = "VIEW_UNCHANGED", False
         else:
             status, alert = "POSSIBLE_VIEW_CHANGE", True
@@ -806,14 +823,19 @@ class Gate2ClosedPositionReport:
             "interval_start": interval["interval_start"].strftime("%Y-%m-%d %H:%M:%S"),
             "interval_end": interval["interval_end"].strftime("%Y-%m-%d %H:%M:%S"),
             "sample_count": sample_count,
+            "closed_position_sample_count": closed_position_sample_count,
             "gate2_detection_count": interval["gate2_detection_count"],
             "centroid_inside_count": interval["centroid_inside_count"],
             "centroid_x_min": self._round_optional(interval["centroid_x_min"]),
             "centroid_x_max": self._round_optional(interval["centroid_x_max"]),
             "centroid_y_min": self._round_optional(interval["centroid_y_min"]),
             "centroid_y_max": self._round_optional(interval["centroid_y_max"]),
-            "avg_detection_inside_roi_percent": round(avg_detection_inside_roi, 2),
-            "avg_coverage_percent": round(avg_detection_inside_roi, 2),
+            "avg_detection_inside_roi_percent": (
+                round(avg_detection_inside_roi, 2) if avg_detection_inside_roi is not None else None
+            ),
+            "avg_coverage_percent": (
+                round(avg_detection_inside_roi, 2) if avg_detection_inside_roi is not None else None
+            ),
             "threshold_percent": round(self.threshold_percent, 2),
             "status": status,
             "alert": alert,
@@ -876,18 +898,21 @@ class Gate2ClosedPositionReport:
         return str(value).strip() if value is not None and str(value).strip() else "N/A"
 
     @staticmethod
-    def _weighted_avg_coverage(rows: list[dict]) -> float:
-        total_samples = sum(int(row["sample_count"]) for row in rows)
+    def _weighted_avg_coverage(rows: list[dict]) -> float | None:
+        total_samples = sum(int(row["closed_position_sample_count"]) for row in rows)
         if not total_samples:
-            return 0.0
+            return None
         coverage_sum = 0.0
         for row in rows:
+            row_sample_count = int(row["closed_position_sample_count"])
+            if not row_sample_count:
+                continue
             row_average = (
                 row["avg_detection_inside_roi_percent"]
                 if "avg_detection_inside_roi_percent" in row
                 else row["avg_coverage_percent"]
             )
-            coverage_sum += float(row_average) * int(row["sample_count"])
+            coverage_sum += float(row_average) * row_sample_count
         return round(coverage_sum / total_samples, 2)
 
     def _build_summary(
@@ -903,7 +928,15 @@ class Gate2ClosedPositionReport:
     ) -> dict:
         avg_area = self._weighted_avg_coverage(rows)
         alert_count = sum(1 for row in rows if row["alert"])
-        threshold_status = "BELOW_THRESHOLD" if alert_count else "WITHIN_LIMIT"
+        closed_position_sample_count = sum(int(row["closed_position_sample_count"]) for row in rows)
+        if alert_count:
+            threshold_status = "BELOW_THRESHOLD"
+        elif not text_files:
+            threshold_status = "NO_SAMPLES"
+        elif not closed_position_sample_count:
+            threshold_status = "NO_CLOSED_DETECTIONS"
+        else:
+            threshold_status = "WITHIN_LIMIT"
         threshold_value = round(float(self.threshold_percent), 2)
         caster = getattr(self, "caster", None)
         return {
@@ -918,6 +951,7 @@ class Gate2ClosedPositionReport:
             "threshold_percent": threshold_value,
             "threshold": threshold_value,
             "total_sample_count": len(text_files),
+            "closed_position_sample_count": closed_position_sample_count,
             "gate2_detection_count": sum(int(row["gate2_detection_count"]) for row in rows),
             "gate2_closed_count": sum(int(row["centroid_inside_count"]) for row in rows),
             "avg_detection_inside_roi_percent": avg_area,
@@ -934,6 +968,11 @@ class Gate2ClosedPositionReport:
             "avg_detection_inside_roi_percent",
             summary["avg_area_covered_percent"],
         )
+        avg_detection_inside_roi_text = (
+            f"{avg_detection_inside_roi:.2f}"
+            if avg_detection_inside_roi is not None
+            else "N/A"
+        )
         return "\n".join([
             f"Date              : {summary['date']}",
             f"Shift             : {summary['shift']}",
@@ -944,9 +983,10 @@ class Gate2ClosedPositionReport:
                 f"({summary['window_start']} -> {summary['window_end']})"
             ),
             f"Total sample count: {summary['total_sample_count']}",
+            f"Closed-position samples: {summary['closed_position_sample_count']}",
             f"Gate2 detection count: {summary['gate2_detection_count']}",
             f"Gate2 closed count   : {summary['gate2_closed_count']}",
-            f"Avg detection inside ROI: {avg_detection_inside_roi:.2f}",
+            f"Avg detection inside ROI: {avg_detection_inside_roi_text}",
             f"Threshold            : {float(summary['threshold']):g}",
         ])
 

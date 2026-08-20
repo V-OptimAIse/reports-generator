@@ -46,7 +46,7 @@ class Gate2ClosedPositionReportTest(unittest.TestCase):
 
         self.assertEqual(frame.gate2_detection_count, 1)
         self.assertEqual(frame.centroid_inside_count, 0)
-        self.assertEqual(frame.coverage_percent, 100.0)
+        self.assertIsNone(frame.coverage_percent)
 
     def test_gate2_detection_half_inside_closed_roi_calculates_50_percent(self):
         report = self._report()
@@ -61,7 +61,7 @@ class Gate2ClosedPositionReportTest(unittest.TestCase):
 
         self.assertEqual(frame.gate2_detection_count, 1)
         self.assertEqual(frame.centroid_inside_count, 0)
-        self.assertEqual(frame.coverage_percent, 0.0)
+        self.assertIsNone(frame.coverage_percent)
 
     def test_gate2_detection_larger_than_roi_uses_detection_area_denominator(self):
         report = self._report()
@@ -70,13 +70,13 @@ class Gate2ClosedPositionReportTest(unittest.TestCase):
         self.assertEqual(frame.gate2_detection_count, 1)
         self.assertAlmostEqual(frame.coverage_percent, 25.0)
 
-    def test_gate2_detection_centroid_outside_closed_roi_still_measures_partial_overlap(self):
+    def test_gate2_detection_centroid_outside_closed_roi_does_not_measure_coverage(self):
         report = self._report()
         frame = self._measure_yolo(report, "3 0.65 0.25 0.5 0.5\n")
 
         self.assertEqual(frame.gate2_detection_count, 1)
         self.assertEqual(frame.centroid_inside_count, 0)
-        self.assertAlmostEqual(frame.coverage_percent, 20.0)
+        self.assertIsNone(frame.coverage_percent)
 
     def test_sample_gate2_line_centroid_is_inside_real_gate2_closed_roi(self):
         report = object.__new__(Gate2ClosedPositionReport)
@@ -265,6 +265,7 @@ class Gate2ClosedPositionReportTest(unittest.TestCase):
 
         self.assertEqual(rows[0]["avg_coverage_percent"], 90.0)
         self.assertEqual(rows[0]["avg_detection_inside_roi_percent"], 90.0)
+        self.assertEqual(rows[0]["closed_position_sample_count"], 2)
         self.assertEqual(rows[0]["status"], "VIEW_UNCHANGED")
         self.assertFalse(rows[0]["alert"])
 
@@ -274,8 +275,10 @@ class Gate2ClosedPositionReportTest(unittest.TestCase):
         self.assertTrue(rows[1]["alert"])
 
         self.assertEqual(rows[2]["sample_count"], 0)
+        self.assertEqual(rows[2]["closed_position_sample_count"], 0)
         self.assertEqual(rows[2]["status"], "NO_SAMPLES")
         self.assertTrue(rows[2]["alert"])
+        self.assertAlmostEqual(report._weighted_avg_coverage(rows), 83.33)
 
     def test_no_sample_interval_can_stay_non_alert_for_recent_runs(self):
         report = self._report()
@@ -287,6 +290,56 @@ class Gate2ClosedPositionReportTest(unittest.TestCase):
 
         self.assertEqual(rows[0]["status"], "NO_SAMPLES")
         self.assertFalse(rows[0]["alert"])
+
+    def test_open_gate2_detections_are_excluded_from_coverage_average(self):
+        report = self._report()
+        start = datetime(2026, 6, 30, 12, 0, 0)
+        end = start + timedelta(minutes=10)
+
+        rows = report._build_interval_rows(
+            start,
+            end,
+            [
+                FrameCoverage(start + timedelta(minutes=1), Path("open.txt"), None, 1, 0),
+                FrameCoverage(start + timedelta(minutes=2), Path("closed.txt"), 90.0, 1, 1),
+            ],
+        )
+
+        self.assertEqual(rows[0]["sample_count"], 2)
+        self.assertEqual(rows[0]["closed_position_sample_count"], 1)
+        self.assertEqual(rows[0]["avg_detection_inside_roi_percent"], 90.0)
+        self.assertEqual(rows[0]["status"], "VIEW_UNCHANGED")
+        self.assertFalse(rows[0]["alert"])
+
+    def test_interval_with_only_open_gate2_detections_has_no_coverage_or_alert(self):
+        report = self._report()
+        start = datetime(2026, 6, 30, 12, 0, 0)
+        end = start + timedelta(minutes=10)
+
+        rows = report._build_interval_rows(
+            start,
+            end,
+            [FrameCoverage(start + timedelta(minutes=1), Path("open.txt"), None, 1, 0)],
+        )
+
+        self.assertEqual(rows[0]["closed_position_sample_count"], 0)
+        self.assertIsNone(rows[0]["avg_detection_inside_roi_percent"])
+        self.assertEqual(rows[0]["status"], "NO_CLOSED_DETECTIONS")
+        self.assertFalse(rows[0]["alert"])
+
+        summary = report._build_summary(
+            date_label="30-06-2026",
+            shift_label="Shift_A",
+            start=start,
+            end=end,
+            text_files=[(start + timedelta(minutes=1), Path("open.txt"))],
+            rows=rows,
+            window_mode="recent",
+        )
+        self.assertEqual(summary["status"], "NO_CLOSED_DETECTIONS")
+        self.assertEqual(summary["closed_position_sample_count"], 0)
+        self.assertIsNone(summary["avg_detection_inside_roi_percent"])
+        self.assertIn("Avg detection inside ROI: N/A", report._summary_body(summary))
 
     def test_recent_export_checks_last_window_and_sends_only_on_alert(self):
         report = object.__new__(Gate2ClosedPositionReport)
