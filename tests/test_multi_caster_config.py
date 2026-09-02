@@ -50,7 +50,11 @@ def _base_cfg():
         },
         "verified_pipe_records_recipients": ["verified@example.com"],
         "verified_pipes_mode": "loadcell",
-        "missing_loadcell_video": {"enabled": True, "delete_after_upload": False},
+        "missing_loadcell_video": {
+            "enabled": True,
+            "delete_after_upload": False,
+        },
+        "videos_upload_to_drive": True,
         "casters": {
             "defaults": {
                 "enabled": True,
@@ -136,6 +140,15 @@ class MultiCasterConfigTest(TestCase):
 
         self.assertEqual(caster2.cfg['rois']['source_resolution'], {'width': 1440, 'height': 1080})
         self.assertEqual(caster3.cfg['rois']['source_resolution'], {'width': 2620, 'height': 1216})
+
+    def test_missing_video_upload_override_is_isolated_per_caster(self):
+        cfg = _base_cfg()
+        cfg["casters"]["items"][0]["videos_upload_to_drive"] = False
+
+        caster1, caster2 = resolve_enabled_casters(cfg, ["caster1", "caster2"])
+
+        self.assertFalse(caster1.cfg["videos_upload_to_drive"])
+        self.assertTrue(caster2.cfg["videos_upload_to_drive"])
 
     def test_legacy_single_caster_runtime_still_resolves(self):
         cfg = _base_cfg()
@@ -538,6 +551,94 @@ class WorkflowOrderingTest(TestCase):
         self.assertIn("normal_upload_finished", events)
         self.assertFalse(result.errors)
         self.assertTrue(result.state["missing_loadcell_overlay_video_drive_link"].startswith("https://drive/caster1/"))
+
+    def test_disabled_video_upload_keeps_local_videos_and_sends_diagnosis_without_links(self):
+        uploads = []
+        deliveries = []
+        tmp_root = None
+        cfg = _base_cfg()
+        cfg["casters"]["items"][0]["videos_upload_to_drive"] = False
+
+        class FakeUploader:
+            def __init__(self, cfg=None, caster=None):
+                self.caster = caster
+
+            def upload_video(self, path, **_kwargs):
+                uploads.append(path)
+                return f"https://drive/{self.caster.id}/{Path(path).name}"
+
+        class FakeOverlayGenerator:
+            def __init__(self, date_str, shift, windows=None, output_name=None, normal_output_name=None, cfg=None, caster=None):
+                self.output_path = tmp_root / output_name
+                self.normal_output_path = tmp_root / normal_output_name
+
+            def generate(self):
+                self.output_path.write_text("overlay", encoding="utf-8")
+                self.normal_output_path.write_text("normal", encoding="utf-8")
+                return str(self.output_path)
+
+        class FakeMailer:
+            def __init__(self, cfg=None):
+                pass
+
+            def send(self, subject, body, attachments=None, recipients=None):
+                deliveries.append((subject, body, list(attachments or [])))
+
+        with (
+            TemporaryDirectory() as tmp,
+            patch.object(report_workflow, "GDriveUploader", FakeUploader),
+            patch.object(report_workflow, "ShiftVideoOverlayGenerator", FakeOverlayGenerator),
+            patch.object(report_workflow, "EmailSender", FakeMailer),
+        ):
+            tmp_root = Path(tmp)
+            wf = self._workflow(tmp, selected_ids=["caster1"], cfg=cfg)
+            run = ShiftRun("02-07-2026", "Shift_A")
+            caster = wf.casters[0]
+            result = report_workflow.CasterRunResult(caster=caster)
+            result.state = {
+                "date": run.date_str,
+                "shift": run.shift_name,
+                "caster_id": caster.id,
+                "caster_number": caster.number,
+            }
+            result.verified_summary = {
+                "removed_count": 0,
+                "loadcell_missing_records": [
+                    {"pipe_uid": "caster1-p1", "origin_time": "2026-07-02 06:10:00"}
+                ],
+            }
+            diagnosis_path = tmp_root / "caster1_diagnosis.xlsx"
+            diagnosis_path.write_text("diagnosis", encoding="utf-8")
+            result.diagnosis_path = str(diagnosis_path)
+            result.diagnosis_summary = {
+                "pipe_count": 10,
+                "abnormal_count": 1,
+                "t_origin_gap_abnormal_count": 0,
+                "t_origin_gap_too_slow_count": 0,
+                "t_origin_gap_too_fast_count": 0,
+                "loadcell_missing_count": 1,
+            }
+            result.diagnosis_exported = True
+            wf.results[caster.id] = result
+
+            wf.phase_missing_loadcell_videos(wf.casters, run)
+
+            self.assertEqual(uploads, [])
+            self.assertEqual(wf._pending_video_uploads, [])
+            self.assertTrue(Path(result.state["missing_loadcell_overlay_video_path"]).exists())
+            self.assertTrue(Path(result.state["missing_loadcell_normal_video_path"]).exists())
+            self.assertTrue(result.state["missing_loadcell_overlay_video_upload_skipped"])
+            self.assertFalse(result.state["missing_loadcell_overlay_video_uploaded"])
+
+            sent = wf._send_consolidated_diagnosis_email(wf.casters, run)
+
+            self.assertTrue(sent)
+            self.assertEqual(len(deliveries), 1)
+            _subject, body, attachments = deliveries[0]
+            self.assertNotIn("Missing Loadcell Videos", body)
+            self.assertNotIn("Overlay Video Link", body)
+            self.assertNotIn("Normal Video Link", body)
+            self.assertEqual(attachments, [str(diagnosis_path)])
 
     def test_test_mode_routes_full_workflow_mail_to_test_recipients(self):
         deliveries = []

@@ -109,9 +109,11 @@ For each enabled or selected caster, the workflow runs these phases in order.
 10. Creates the diagnosis XLSX.
 11. Builds missing-loadcell video windows from verified-pipe results.
 12. Generates missing-loadcell overlay and normal videos.
-13. Uploads missing-loadcell videos to Google Drive.
+13. Uploads missing-loadcell videos to Google Drive when that caster's
+    `videos_upload_to_drive` setting is `true`.
 14. Deletes missing-loadcell videos after upload if configured.
-15. Sends the diagnosis email with the XLSX and missing-loadcell links.
+15. Sends the diagnosis email with the XLSX. Missing-loadcell links are included
+    only for casters whose video upload setting is enabled.
 16. Generates the normal full-shift video locally.
 17. Only after successful full-shift video creation, deletes the source `Shift_*_img` and `Shift_*_text` folders for that shift.
 18. Removes empty date folders, such as the old date folder after `Shift_C` completes.
@@ -147,13 +149,14 @@ Key sections:
 
 - `history.shifts`: shift start/end times.
 - `casters.defaults`: shared caster templates for DB, history, output, and Drive paths.
-- `casters.items`: caster list, numbers, enabled flags, var dirs, and ROI files.
+- `casters.items`: caster list, numbers, enabled flags, var dirs, ROI files, and
+  individual `videos_upload_to_drive` settings.
 - `database.path`: resolved per caster to the SQLite pipe database.
 - `history.image_root`: resolved per caster to the image/text history root.
 - `rois`: ROI YAML path and coordinate source resolution.
 - `outputs.csv_dir`: local CSV/XLSX output directory.
 - `video`: FPS, codec, resolution, full-shift video dir, overlay video dir.
-- `missing_loadcell_video`: missing-loadcell clip settings and delete-after-upload.
+- `missing_loadcell_video`: missing-loadcell clip generation and delete-after-upload behavior.
 - `diagnosis`: t-origin gap thresholds for abnormal-row reporting.
 - `gdrive`: rclone remote and Drive folder names.
 - `email`: SMTP sender, recipients, test recipients, and password env var.
@@ -162,6 +165,23 @@ Key sections:
 
 The current config supports multiple casters. Enabled casters are resolved by
 `reports/common/caster_config.py`.
+
+Missing-loadcell video upload can be controlled independently for each caster:
+
+```yaml
+casters:
+  items:
+    - id: caster2
+      videos_upload_to_drive: false
+
+    - id: caster3
+      videos_upload_to_drive: true
+```
+
+When `videos_upload_to_drive` is `false`, the overlay and normal videos are still
+generated locally, but they are not uploaded or deleted after upload. The caster's
+diagnosis XLSX email is still sent and its email section does not contain video
+links.
 
 ## Inputs
 

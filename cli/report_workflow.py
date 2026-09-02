@@ -384,6 +384,7 @@ class ShiftWorkflow:
         video_cfg = cfg.get("missing_loadcell_video", {}) or {}
         return {
             "enabled": bool(video_cfg.get("enabled", True)),
+            "upload_to_drive": bool(cfg.get("videos_upload_to_drive", True)),
             "pre_origin_seconds": self._parse_positive_int(
                 video_cfg.get("pre_origin_seconds"),
                 default=60,
@@ -504,6 +505,20 @@ class ShiftWorkflow:
             result.state[f"missing_loadcell_{kind}_video_skipped"] = True
             result.state[f"missing_loadcell_{kind}_video_skip_reason"] = reason
         self._save_state(run, result.caster, result.state)
+
+    def _skip_missing_loadcell_video_uploads(self, run: ShiftRun, result: CasterRunResult, reason: str):
+        for kind in ("overlay", "normal"):
+            result.state[f"missing_loadcell_{kind}_video_uploaded"] = False
+            result.state[f"missing_loadcell_{kind}_video_upload_pending"] = False
+            result.state[f"missing_loadcell_{kind}_video_upload_skipped"] = True
+            result.state[f"missing_loadcell_{kind}_video_upload_skip_reason"] = reason
+        result.state["missing_loadcell_video_uploads_skipped_at"] = datetime.now().isoformat(timespec="seconds")
+        self._save_state(run, result.caster, result.state)
+        logger.info(
+            "Missing-loadcell video uploads skipped | caster=%s | reason=%s",
+            result.caster.id,
+            reason,
+        )
 
     def _submit_missing_loadcell_video_upload(
         self,
@@ -664,6 +679,7 @@ class ShiftWorkflow:
                 result.state.pop(key, None)
         result.state["missing_loadcell_video_strategy"] = "merged_window_compilation_overlay_and_normal"
         result.state["missing_loadcell_video_record_count"] = len(records)
+        result.state["missing_loadcell_video_upload_to_drive"] = video_cfg["upload_to_drive"]
 
         if not video_cfg["enabled"]:
             self._skip_missing_loadcell_videos(run, result, "missing_loadcell_video.enabled is false")
@@ -702,6 +718,14 @@ class ShiftWorkflow:
         result.state["missing_loadcell_overlay_video_path"] = overlay_path
         result.state["missing_loadcell_normal_video_path"] = normal_path
         self._save_state(run, result.caster, result.state)
+
+        if not video_cfg["upload_to_drive"]:
+            self._skip_missing_loadcell_video_uploads(
+                run,
+                result,
+                "videos_upload_to_drive is false",
+            )
+            return
 
         result.state["missing_loadcell_video_uploads_queued_at"] = datetime.now().isoformat(timespec="seconds")
         self._save_state(run, result.caster, result.state)
@@ -1052,6 +1076,9 @@ class ShiftWorkflow:
             return f"N/A - {timeout_reason}"
         if result.state.get(f"{prefix}_upload_error"):
             return "N/A - Upload failed"
+        upload_skip_reason = result.state.get(f"{prefix}_upload_skip_reason")
+        if upload_skip_reason:
+            return f"N/A - {upload_skip_reason}"
         if result.state.get(f"{prefix}_upload_pending"):
             return "N/A - Upload pending"
         if result.state.get(f"{prefix}_path"):
@@ -1064,7 +1091,7 @@ class ShiftWorkflow:
         min_gap_label, max_gap_label = self._diagnosis_gap_labels(diagnosis_summary)
         pipe_count = self._summary_count(diagnosis_summary, "pipe_count")
         pipe_noun = "Pipe" if pipe_count == "1" else "Pipes"
-        return [
+        lines = [
             f"### {caster_label(result.caster, result.caster.cfg)}: {pipe_count} {pipe_noun}",
             "",
             f"Abnormal Rows                       : {self._summary_count(diagnosis_summary, 'abnormal_count')}",
@@ -1074,6 +1101,10 @@ class ShiftWorkflow:
             f"Loadcell Missing Rows               : {self._summary_count(diagnosis_summary, 'loadcell_missing_count')}",
             f"Removed Pipe ID Count               : {self._summary_count(verified_summary, 'removed_count', unavailable='N/A')}",
             f"Removed Pipe ID Reason              : {self._display_text(self._removed_pipe_reason(verified_summary))}",
+        ]
+        if not self._missing_loadcell_video_cfg(result.caster.cfg)["upload_to_drive"]:
+            return lines
+        return lines + [
             "",
             "Missing Loadcell Videos",
             "",
@@ -1140,6 +1171,8 @@ class ShiftWorkflow:
         self._send_consolidated_verified_pipes_email([result.caster], run)
 
     def _missing_loadcell_video_lines(self, result: CasterRunResult) -> list[str]:
+        if not self._missing_loadcell_video_cfg(result.caster.cfg)["upload_to_drive"]:
+            return []
         return [
             "",
             "Missing Loadcell Videos",

@@ -152,6 +152,7 @@ casters:
       number: 1
       enabled: false
       var_dir: ../electrosteel_pipe_detection_prod/var/caster_1
+      videos_upload_to_drive: true
       rois:
         path: ../electrosteel_pipe_detection_prod/config/casters/caster_1/rois.yaml
 
@@ -159,6 +160,8 @@ casters:
       number: 2
       enabled: true
       var_dir: ../electrosteel_pipe_detection_prod/var/caster_2
+      # true uploads both normal and overlay missing-loadcell videos; false keeps both local.
+      videos_upload_to_drive: true
       rois:
         path: ../electrosteel_pipe_detection_prod/config/casters/caster_2/rois.yaml
 
@@ -166,6 +169,7 @@ casters:
       number: 3
       enabled: true
       var_dir: ../electrosteel_pipe_detection_prod/var/caster_3
+      videos_upload_to_drive: true
       rois:
         path: ../electrosteel_pipe_detection_prod/config/casters/caster_3/rois.yaml
         # Caster 3 ROI points use the original 2620x1216 camera coordinate space.
@@ -178,6 +182,7 @@ casters:
       number: 4
       enabled: false
       var_dir: ../electrosteel_pipe_detection_prod/var/caster_4
+      videos_upload_to_drive: true
       rois:
         path: ../electrosteel_pipe_detection_prod/config/casters/caster_4/rois.yaml
 
@@ -185,6 +190,7 @@ casters:
       number: 5
       enabled: false
       var_dir: ../electrosteel_pipe_detection_prod/var/caster_5
+      videos_upload_to_drive: true
       rois:
         path: ../electrosteel_pipe_detection_prod/config/casters/caster_5/rois.yaml
 
@@ -192,6 +198,7 @@ casters:
       number: 6
       enabled: false
       var_dir: ../electrosteel_pipe_detection_prod/var/caster_6
+      videos_upload_to_drive: true
       rois:
         path: ../electrosteel_pipe_detection_prod/config/casters/caster_6/rois.yaml
 
@@ -199,6 +206,7 @@ casters:
       number: 7
       enabled: false
       var_dir: ../electrosteel_pipe_detection_prod/var/caster_7
+      videos_upload_to_drive: true
       rois:
         path: ../electrosteel_pipe_detection_prod/config/casters/caster_7/rois.yaml
 
@@ -206,5 +214,6 @@ casters:
       number: 8
       enabled: false
       var_dir: ../electrosteel_pipe_detection_prod/var/caster_8
+      videos_upload_to_drive: true
       rois:
         path: ../electrosteel_pipe_detection_prod/config/casters/caster_8/rois.yaml
