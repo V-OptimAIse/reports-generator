@@ -161,7 +161,7 @@ casters:
       enabled: true
       var_dir: ../electrosteel_pipe_detection_prod/var/caster_2
       # true uploads both normal and overlay missing-loadcell videos; false keeps both local.
-      videos_upload_to_drive: true
+      videos_upload_to_drive: false
       rois:
         path: ../electrosteel_pipe_detection_prod/config/casters/caster_2/rois.yaml
 
@@ -169,7 +169,7 @@ casters:
       number: 3
       enabled: true
       var_dir: ../electrosteel_pipe_detection_prod/var/caster_3
-      videos_upload_to_drive: true
+      videos_upload_to_drive: false
       rois:
         path: ../electrosteel_pipe_detection_prod/config/casters/caster_3/rois.yaml
         # Caster 3 ROI points use the original 2620x1216 camera coordinate space.
