@@ -92,7 +92,7 @@ email:
   send_csv_attachment: true   # true = attach CSV mail, false = skip attachment mail
   smtp_port: 587
   sender: innovate@v-optimai.com
-  # password: fmnjjxnjzwvfjyzc
+  sender_name: V-OPTIMAISE CLIMATE TECH SOLUTIONS
   password_env: EMAIL_APP_PASSWORD
   recipients:
     - punithsai2001@gmail.com
@@ -100,7 +100,6 @@ email:
     - karikutisasikumar1301@gmail.com
     - shyamsundar.pilli@v-optimai.com
     - aakashpalina2019@gmail.com
-    - sridharcharanchekka@gmail.com
   # Used by --test; production, diagnosis, and verified lists are not used in test mode.
   test_recipients:
     - karikutisasikumar1301@gmail.com

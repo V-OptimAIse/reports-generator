@@ -71,6 +71,17 @@ class EmailSenderTest(TestCase):
         self.assertTrue(any("smtp_send=" in line for line in logs.output))
         self.assertTrue(any("smtp_quit=" in line for line in logs.output))
 
+    def test_sender_display_name_is_used_in_from_header(self):
+        cfg = _cfg()
+        cfg["email"]["sender_name"] = "V-OPTIMAISE CLIMATE TECH SOLUTIONS"
+
+        with patch("reports.common.email_sender.smtplib.SMTP", FakeSmtp):
+            EmailSender(cfg=cfg).send("Subject", "Plain report")
+
+        from_address = FakeSmtp.sent_messages[0]["From"].addresses[0]
+        self.assertEqual(from_address.display_name, "V-OPTIMAISE CLIMATE TECH SOLUTIONS")
+        self.assertEqual(from_address.addr_spec, "sender@example.com")
+
     def test_html_body_creates_multipart_alternative_and_keeps_attachment(self):
         with TemporaryDirectory() as tmp:
             attachment = Path(tmp) / "verified.csv"

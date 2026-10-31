@@ -2,6 +2,7 @@ import logging
 import os
 import smtplib
 import time
+from email.headerregistry import Address
 from email.message import EmailMessage
 from pathlib import Path
 
@@ -17,6 +18,7 @@ class EmailSender:
         cfg = cfg or load_runtime_config()
         self.email_cfg = cfg["email"]
         self.sender = self.email_cfg["sender"]
+        self.sender_name = self.email_cfg.get("sender_name")
         self.recipients = self.email_cfg["recipients"]
         self.smtp_timeout = float(self.email_cfg.get("smtp_timeout", 15))
         if self.smtp_timeout <= 0:
@@ -140,7 +142,11 @@ class EmailSender:
         started = time.perf_counter()
         msg = EmailMessage()
         msg["Subject"] = subject
-        msg["From"] = self.sender
+        msg["From"] = (
+            Address(display_name=self.sender_name, addr_spec=self.sender)
+            if self.sender_name
+            else self.sender
+        )
         msg["To"] = ", ".join(to_recipients)
         msg.set_content(body)
         if html_body is not None:
